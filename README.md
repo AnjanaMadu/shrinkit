@@ -8,21 +8,8 @@ Every push builds a Windows `Shrinkit.exe` under **GitHub Releases** (tag `build
 
 ## Screenshots
 
-### 1. Folders
-
-![Folders view](screenshots/01.png)
-
-### 2. Preset picker
-
-![Preset picker](screenshots/02.png)
-
-### 3. Compress progress
-
-![Progress](screenshots/03.png)
-
-### 4. Done
-
-![Done](screenshots/04.png)
+![Image 1](screenshots/01.png)
+![Image 2](screenshots/02.png)
 
 ## Requirements
 

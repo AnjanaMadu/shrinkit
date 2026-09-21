@@ -1,25 +1,31 @@
-"""Shrinkit — browse phone videos by folder, compress via ffmpeg, push back."""
+"""Shrinkit — pick videos on your phone, compress them with ffmpeg, push them back.
+
+UI v3: sidebar navigation, multi-select library, live selection inspector and a
+batch queue view. All widgets are painted / styled in code (no image assets).
+Backend modules (adb, ffmpeg, cache, presets, thumbs, workers) are unchanged.
+"""
 
 from __future__ import annotations
 
 import datetime
 import logging
+import math
 import os
 import sys
 
 from PyQt6.QtCore import (
-    QAbstractListModel, QEvent, QModelIndex, QPointF, QRect, QRectF, QSize, Qt,
-    QTimer, QUrl, pyqtSignal,
+    QAbstractListModel, QModelIndex, QObject, QPoint, QPointF, QRect, QRectF,
+    QSize, Qt, QTimer, QUrl, QVariantAnimation, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QDesktopServices, QFont, QFontMetrics, QPainter,
-    QPainterPath, QPen, QPixmap, QMouseEvent,
+    QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon,
+    QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListView, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QRadioButton, QSlider, QStackedWidget,
-    QStyle, QStyledItemDelegate, QTextEdit, QVBoxLayout, QWidget,
+    QAbstractButton, QApplication, QButtonGroup, QDialog, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QListView, QMainWindow, QMenu, QPlainTextEdit,
+    QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QStyle,
+    QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 import adb
@@ -29,15 +35,17 @@ from presets import DEFAULT_PRESET_ID, PRESETS
 from thumbs import ThumbnailWorker
 from workers import PipelineWorker, VideoLoadWorker
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-# pages
-P_HOME, P_FOLDER, P_PRESET, P_WORK, P_DONE = range(5)
+PAGE_LIBRARY, PAGE_QUEUE = range(2)
+ROLE_VIDEO = Qt.ItemDataRole.UserRole + 1
+PREVIEW_BATCH = 120          # max previews requested per click
+SCROLLBAR_W = 10
 
-ROLE_ITEM = Qt.ItemDataRole.UserRole + 1
 
-
-# ---------- logging ----------
+# ======================================================================
+# logging (unchanged behaviour)
+# ======================================================================
 
 def _setup_logging() -> str:
     from PyQt6.QtCore import QStandardPaths
@@ -59,7 +67,9 @@ LOG_DIR = _setup_logging()
 log = logging.getLogger("shrinkit")
 
 
-# ---------- helpers ----------
+# ======================================================================
+# formatting helpers
+# ======================================================================
 
 def fmt_size(n: int) -> str:
     n = max(0, int(n or 0))
@@ -77,1055 +87,2560 @@ def fmt_dur(ms: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def fmt_date(ts: int) -> str:
+def short_date(ts: int) -> str:
     if not ts:
-        return "—"
+        return ""
+    try:
+        d = datetime.datetime.fromtimestamp(ts)
+    except (OSError, ValueError, OverflowError):
+        return ""
+    txt = d.strftime("%b %d").replace(" 0", " ")
+    return txt if d.year == datetime.datetime.now().year else f"{txt}, {d.year}"
+
+
+def long_date(ts: int) -> str:
+    if not ts:
+        return ""
     try:
         return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-    except (OSError, ValueError):
-        return "—"
+    except (OSError, ValueError, OverflowError):
+        return ""
 
 
-def cover_pixmap(pm: QPixmap, w: int, h: int) -> QPixmap:
-    """Center-crop pixmap to exactly w×h."""
-    if pm.isNull():
-        return pm
-    scaled = pm.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                       Qt.TransformationMode.SmoothTransformation)
-    x = max(0, (scaled.width() - w) // 2)
-    y = max(0, (scaled.height() - h) // 2)
-    return scaled.copy(x, y, w, h)
+def res_label(v) -> str:
+    s = min(v.width or 0, v.height or 0)
+    if not s:
+        return ""
+    if s >= 2100:
+        return "4K"
+    if s >= 1400:
+        return "1440p"
+    if s >= 1060:
+        return "1080p"
+    if s >= 700:
+        return "720p"
+    return f"{s}p"
 
 
-# ---------- stylesheet (pure QSS, no external images) ----------
-# Checked states use solid colors only (no url(image) references), so the
-# app works from source, from a PyInstaller exe, read-only / locked-down
-# temp dirs, and on any OS without writing PNGs at runtime.
-
-def build_stylesheet() -> str:
-    return STYLESHEET
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
-STYLESHEET = """
-* { font-size: 13px; }
-QMainWindow, QWidget { background: #131316; color: #e8e8ea; }
-#Header { background: #1a1a1f; border-bottom: 1px solid #2a2a31; }
-#Header QLabel { background: transparent; }
-#Title { font-size: 16px; font-weight: 700; color: #ffffff; background: transparent; }
-#Subtitle { color: #8e8e96; background: transparent; }
-#Muted { color: #8e8e96; background: transparent; }
-#Crumb { font-size: 14px; font-weight: 600; color: #ffffff; }
-QPushButton { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42;
-              border-radius: 8px; padding: 8px 14px; }
-QPushButton:hover { background: #2e2e35; }
-QPushButton[primary="true"] { background: #f2f2f4; color: #131316; border: none;
-                              border-radius: 8px; padding: 8px 18px; font-weight: 600; }
-QPushButton[primary="true"]:hover { background: #ffffff; }
-QPushButton[primary="true"]:disabled { background: #3a3a42; color: #77777f; }
-QPushButton:disabled { background: #232328; color: #66666e; border-color: #2c2c32; }
-QLineEdit { padding: 7px 10px; border: 1px solid #34343c; border-radius: 8px;
-            background: #1e1e24; color: #e8e8ea; selection-background-color: #4a4a55; }
-QComboBox { padding: 7px 10px; border: 1px solid #34343c; border-radius: 8px;
-            background: #1e1e24; color: #e8e8ea; }
-QComboBox:hover, QComboBox:focus { border-color: #4a4a55; }
-QComboBox::drop-down { border: none; background: transparent; width: 24px; }
-QComboBox QAbstractItemView { background: #1e1e24; color: #e8e8ea;
-                             selection-background-color: #4ade80; selection-color: #131316;
-                             border: 1px solid #34343c; outline: 0; }
-QComboBox QAbstractItemView::item { padding: 6px 10px; background: #1e1e24; color: #e8e8ea; }
-QComboBox QAbstractItemView::item:selected { background: #4ade80; color: #131316; }
-QComboBox QAbstractItemView::item:hover:!selected { background: #2a2a31; color: #ffffff; }
-QListView { background: transparent; border: none; outline: none; }
-QListView::item { background: transparent; border: none; }
-QListView::item:selected { background: transparent; }
-QRadioButton, QCheckBox { color: #e8e8ea; spacing: 8px; background: transparent; }
-QRadioButton::indicator { width: 16px; height: 16px; border-radius: 8px;
-                         border: 1px solid #55555f; background: #1e1e24; }
-QRadioButton::indicator:hover { border-color: #4ade80; }
-QRadioButton::indicator:checked { background: #4ade80; border: 2px solid #1e1e24;
-                                outline: 1px solid #4ade80; }
-QRadioButton::indicator:checked:hover { background: #4ade80; border: 2px solid #1e1e24;
-                                      outline: 1px solid #4ade80; }
-QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px;
-                      border: 1px solid #55555f; background: #1e1e24; }
-QCheckBox::indicator:hover { border-color: #4ade80; }
-QCheckBox::indicator:checked { background: #4ade80; border: 1px solid #4ade80; }
-QCheckBox::indicator:checked:hover { background: #4ade80; border: 1px solid #4ade80; }
-QProgressBar { background: #232329; border: 1px solid #2e2e35; border-radius: 6px;
-               text-align: center; color: #b9b9c1; height: 18px; }
-QProgressBar::chunk { background: #4ade80; border-radius: 5px; }
-QTextEdit { background: #0c0c0f; color: #c9c9d1; border: 1px solid #26262c; border-radius: 8px;
-            font-family: Consolas, monospace; font-size: 12px; }
-QSlider::groove:horizontal { background: #2c2c33; height: 6px; border-radius: 3px; }
-QSlider::handle:horizontal { background: #f2f2f4; width: 14px; height: 14px;
-                             margin: -4px 0; border-radius: 7px; }
-QScrollBar:vertical { background: transparent; width: 10px; }
-QScrollBar::handle:vertical { background: #34343c; border-radius: 5px; min-height: 30px; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QToolTip { background: #26262c; color: #e8e8ea; border: 1px solid #3a3a42; }
+def base_name(path: str) -> str:
+    return (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+
+
+# ======================================================================
+# design tokens + stylesheet
+# ======================================================================
+
+class C:
+    BG = "#111318"
+    BG_DEEP = "#0D0F13"
+    SURFACE = "#171A20"
+    SURFACE_HI = "#1D212A"
+    RAISED = "#1F242D"
+    RAISED_HI = "#282E39"
+    BORDER = "#272C36"
+    BORDER_HI = "#384050"
+    TEXT = "#E8EBF1"
+    MUTED = "#9BA3B2"
+    DIM = "#6B7486"
+    ACCENT = "#6A97FF"
+    ACCENT_HI = "#89ACFF"
+    ACCENT_BG = "#1C2842"
+    ON_ACCENT = "#08102A"
+    OK = "#43D69C"
+    ERR = "#FF7070"
+    WARN = "#F3B94D"
+
+
+_QSS = """
+* { outline: none; }
+QMainWindow, QDialog { background: @BG; }
+QToolTip { background: @RAISED; color: @TEXT; border: 1px solid @BORDER_HI;
+           padding: 6px 8px; border-radius: 6px; }
+
+QLabel { background: transparent; color: @TEXT; }
+QLabel#H1 { font-size: 24px; font-weight: 600; }
+QLabel#H2 { font-size: 15px; font-weight: 600; }
+QLabel#Brand { font-size: 17px; font-weight: 600; }
+QLabel#Section { color: @DIM; font-size: 12px; font-weight: 600; padding-left: 6px; }
+QLabel#Field { color: @MUTED; font-size: 12px; font-weight: 600; }
+QLabel#Muted { color: @MUTED; }
+QLabel#Dim { color: @DIM; font-size: 12px; }
+QLabel#PresetName { font-size: 14px; font-weight: 600; }
+QLabel#Count { background: @ACCENT_BG; color: @ACCENT_HI; border-radius: 9px;
+               padding: 1px 8px; font-size: 12px; font-weight: 600; }
+QLabel#Chip { background: @RAISED; color: @MUTED; border: 1px solid @BORDER;
+              border-radius: 6px; padding: 1px 7px; font-size: 11px; }
+QLabel#ChipAccent { background: @ACCENT_BG; color: @ACCENT_HI; border: 1px solid #2A3A5E;
+                    border-radius: 6px; padding: 1px 7px; font-size: 11px; font-weight: 600; }
+QLabel#Hint { color: @DIM; border: 1px dashed @BORDER_HI; border-radius: 12px;
+              padding: 18px 16px; }
+QLabel#BannerText { color: #F1D9A2; }
+QLabel#RowName { font-size: 13px; font-weight: 600; }
+QLabel#RowDetail { color: @MUTED; font-size: 12px; }
+QLabel#RowDetail[tone="ok"] { color: @OK; }
+QLabel#RowDetail[tone="err"] { color: @ERR; }
+QLabel#RowDetail[tone="accent"] { color: @ACCENT_HI; }
+
+QFrame#Sidebar { background: @BG_DEEP; border: none; border-right: 1px solid @BORDER; }
+QFrame#Inspector { background: @BG_DEEP; border: none; border-left: 1px solid @BORDER; }
+QFrame#InspectorFooter { background: @BG_DEEP; border: none; border-top: 1px solid @BORDER; }
+QFrame#DeviceCard { background: @SURFACE; border: 1px solid @BORDER; border-radius: 12px; }
+QFrame#Banner { background: #2A2313; border: 1px solid #4A3E1C; border-radius: 10px; }
+QFrame#SettingsCard { background: @SURFACE; border: 1px solid @BORDER; border-radius: 12px; }
+QFrame#Sep { background: @BORDER; border: none; max-height: 1px; min-height: 1px; }
+
+QFrame#PresetCard, QFrame#CustomCard {
+    background: @SURFACE; border: 1px solid @BORDER; border-radius: 12px; }
+QFrame#PresetCard:hover { background: @SURFACE_HI; border-color: @BORDER_HI; }
+QFrame#PresetCard[active="true"] { background: @ACCENT_BG; border-color: @ACCENT; }
+
+QFrame#QueueRow { background: @SURFACE; border: 1px solid @BORDER; border-radius: 12px; }
+QFrame#QueueRow[state="active"] { background: @SURFACE_HI; border-color: #3A4C78; }
+
+QFrame#Segmented { background: @BG; border: 1px solid @BORDER; border-radius: 9px; }
+QPushButton[seg="true"] { background: transparent; border: none; border-radius: 7px;
+                          padding: 0 4px; min-height: 28px; color: @MUTED; font-weight: 500; }
+QPushButton[seg="true"]:hover { color: @TEXT; background: transparent; }
+QPushButton[seg="true"]:checked { background: @RAISED_HI; color: @TEXT; }
+QPushButton[seg="true"]:disabled { color: @DIM; background: transparent; }
+
+QPushButton { background: @RAISED; color: @TEXT; border: 1px solid @BORDER;
+              border-radius: 9px; padding: 0 14px; min-height: 34px; font-weight: 500; }
+QPushButton:hover { background: @RAISED_HI; border-color: @BORDER_HI; }
+QPushButton:pressed { background: @SURFACE; }
+QPushButton:focus { border-color: @ACCENT; }
+QPushButton:disabled { background: @SURFACE; color: @DIM; border-color: @BORDER; }
+QPushButton[variant="primary"] { background: @ACCENT; border: 1px solid @ACCENT;
+                                 color: @ON_ACCENT; font-weight: 600; }
+QPushButton[variant="primary"]:hover { background: @ACCENT_HI; border-color: @ACCENT_HI; }
+QPushButton[variant="primary"]:pressed { background: @ACCENT; }
+QPushButton[variant="primary"]:disabled { background: @RAISED; border-color: @BORDER; color: @DIM; }
+QPushButton[variant="ghost"] { background: transparent; border: 1px solid transparent; color: @MUTED; }
+QPushButton[variant="ghost"]:hover { background: @RAISED; color: @TEXT; }
+QPushButton[variant="ghost"]:disabled { color: @DIM; background: transparent; }
+QPushButton[variant="danger"] { background: transparent; border: 1px solid #5A2E33; color: @ERR; }
+QPushButton[variant="danger"]:hover { background: #2A1A1E; border-color: #7A3B42; }
+QPushButton[variant="danger"]:disabled { color: @DIM; border-color: @BORDER; background: transparent; }
+QPushButton[variant="link"] { background: transparent; border: none; color: @ACCENT;
+                              padding: 0 4px; min-height: 24px; }
+QPushButton[variant="link"]:hover { color: @ACCENT_HI; background: transparent; }
+QPushButton#SettingsBtn { text-align: left; padding-left: 12px; }
+
+QLineEdit { background: @BG; color: @TEXT; border: 1px solid @BORDER; border-radius: 9px;
+            padding: 0 8px; min-height: 34px; selection-background-color: @ACCENT;
+            selection-color: @ON_ACCENT; }
+QLineEdit:hover { border-color: @BORDER_HI; }
+QLineEdit:focus { border-color: @ACCENT; }
+
+QSlider { min-height: 22px; }
+QSlider::groove:horizontal { height: 4px; background: @BORDER_HI; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: @ACCENT; border-radius: 2px; }
+QSlider::handle:horizontal { width: 16px; height: 16px; margin: -6px 0; border-radius: 8px;
+                             background: @TEXT; border: none; }
+QSlider::handle:horizontal:hover { background: #FFFFFF; }
+
+QScrollArea { background: transparent; border: none; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: @BORDER_HI; border-radius: 3px; min-height: 40px;
+                              margin: 0 2px; }
+QScrollBar::handle:vertical:hover { background: @DIM; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; background: none; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+QScrollBar:horizontal { height: 0; }
+
+QListView { background: transparent; border: none; }
+QListView#Tray { background: @SURFACE; border: 1px solid @BORDER; border-radius: 12px; padding: 4px; }
+
+QPlainTextEdit#Log { background: @BG_DEEP; color: @MUTED; border: 1px solid @BORDER;
+                     border-radius: 10px; padding: 10px;
+                     font-family: "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+                     font-size: 12px; selection-background-color: @ACCENT;
+                     selection-color: @ON_ACCENT; }
+
+QMenu { background: @SURFACE_HI; border: 1px solid @BORDER_HI; border-radius: 10px; padding: 6px; }
+QMenu::item { padding: 7px 26px 7px 8px; border-radius: 6px; color: @TEXT; }
+QMenu::item:selected { background: @RAISED_HI; }
 """
 
 
-# ---------- models ----------
-
-class FolderListModel(QAbstractListModel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.folders: list[adb.Folder] = []
-
-    def set_folders(self, folders: list[adb.Folder]):
-        self.beginResetModel()
-        self.folders = list(folders)
-        self.endResetModel()
-
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self.folders)
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or index.row() >= len(self.folders):
-            return None
-        f = self.folders[index.row()]
-        if role == Qt.ItemDataRole.DisplayRole:
-            return f.name
-        if role == ROLE_ITEM:
-            return f
-        return None
+def build_qss() -> str:
+    names = sorted((n for n in vars(C) if n.isupper()), key=len, reverse=True)
+    qss = _QSS
+    for n in names:
+        qss = qss.replace("@" + n, getattr(C, n))
+    return qss
 
 
-class VideoListModel(QAbstractListModel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.videos: list[adb.Video] = []
-        self.sort_key = "modified"
-        self.reverse = True
+def apply_theme(app: QApplication) -> None:
+    app.setStyle("Fusion")
+    f = QFont()
+    f.setFamilies(["Inter", "Segoe UI Variable Text", "Segoe UI", "SF Pro Text",
+                   "Helvetica Neue", "Ubuntu", "Noto Sans", "DejaVu Sans"])
+    f.setPixelSize(13)
+    f.setStyleHint(QFont.StyleHint.SansSerif)
+    app.setFont(f)
 
-    def set_videos(self, videos: list[adb.Video]):
-        self.beginResetModel()
-        self.videos = list(videos)
-        self._apply_sort()
-        self.endResetModel()
-
-    def _apply_sort(self):
-        key = {
-            "name": lambda v: v.name.lower(),
-            "size": lambda v: v.size,
-            "duration": lambda v: v.duration_ms,
-            "modified": lambda v: v.modified,
-        }.get(self.sort_key, lambda v: v.modified)
-        try:
-            self.videos.sort(key=key, reverse=self.reverse)
-        except TypeError:
-            pass
-
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self.videos)
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or index.row() >= len(self.videos):
-            return None
-        v = self.videos[index.row()]
-        if role == Qt.ItemDataRole.DisplayRole:
-            return v.name
-        if role == ROLE_ITEM:
-            return v
-        return None
+    pal = QPalette()
+    R = QPalette.ColorRole
+    for role, col in (
+        (R.Window, C.BG), (R.WindowText, C.TEXT), (R.Base, C.BG), (R.AlternateBase, C.SURFACE),
+        (R.Text, C.TEXT), (R.Button, C.RAISED), (R.ButtonText, C.TEXT),
+        (R.ToolTipBase, C.RAISED), (R.ToolTipText, C.TEXT), (R.Highlight, C.ACCENT),
+        (R.HighlightedText, C.ON_ACCENT), (R.PlaceholderText, C.DIM), (R.Link, C.ACCENT),
+    ):
+        pal.setColor(role, QColor(col))
+    for role in (R.Text, R.ButtonText, R.WindowText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(C.DIM))
+    app.setPalette(pal)
+    app.setStyleSheet(build_qss())
 
 
-# ---------- painting shared ----------
+# ======================================================================
+# vector glyphs → crisp icons without image files
+# ======================================================================
 
-TILE_W, TILE_H = 216, 208
-THUMB_W, THUMB_H = 192, 108
-RADIUS = 10
+def _poly(p: QPainter, pts, close=False):
+    path = QPainterPath(QPointF(*pts[0]))
+    for x, y in pts[1:]:
+        path.lineTo(x, y)
+    if close:
+        path.closeSubpath()
+    p.drawPath(path)
 
 
-def _rounded_clip(p: QPainter, rect: QRect, r: int) -> QPainterPath:
+def _g_search(p):
+    p.drawEllipse(QPointF(10.5, 10.5), 6.0, 6.0)
+    p.drawLine(QPointF(15.0, 15.0), QPointF(20.0, 20.0))
+
+
+def _g_refresh(p):
+    rect = QRectF(5, 5, 14, 14)
+    path = QPainterPath()
+    path.arcMoveTo(rect, 60)
+    path.arcTo(rect, 60, 280)
+    p.drawPath(path)
+    a = math.radians(340)
+    ex, ey = 12 + 7 * math.cos(a), 12 - 7 * math.sin(a)
+    tx, ty = -math.sin(a), -math.cos(a)
+    for s in (1, -1):
+        ang = math.atan2(-ty, -tx) + s * math.radians(42)
+        p.drawLine(QPointF(ex, ey), QPointF(ex + 4.2 * math.cos(ang), ey + 4.2 * math.sin(ang)))
+
+
+def _g_sliders(p):
+    for y, kx in ((7, 9.0), (12, 15.0), (17, 8.0)):
+        p.drawLine(QPointF(4, y), QPointF(kx - 2.9, y))
+        p.drawLine(QPointF(kx + 2.9, y), QPointF(20, y))
+        p.drawEllipse(QPointF(kx, y), 2.1, 2.1)
+
+
+def _g_folder(p):
+    path = QPainterPath()
+    path.moveTo(3.5, 7.5)
+    path.quadTo(3.5, 5.5, 5.5, 5.5)
+    path.lineTo(9.3, 5.5)
+    path.lineTo(11.3, 7.8)
+    path.lineTo(18.5, 7.8)
+    path.quadTo(20.5, 7.8, 20.5, 9.8)
+    path.lineTo(20.5, 17.5)
+    path.quadTo(20.5, 19.5, 18.5, 19.5)
+    path.lineTo(5.5, 19.5)
+    path.quadTo(3.5, 19.5, 3.5, 17.5)
+    path.closeSubpath()
+    p.drawPath(path)
+
+
+def _g_grid(p):
+    for x in (4.0, 13.5):
+        for y in (4.0, 13.5):
+            p.drawRoundedRect(QRectF(x, y, 6.5, 6.5), 1.8, 1.8)
+
+
+def _g_film(p):
+    p.drawRoundedRect(QRectF(3.5, 5.5, 17, 13), 3, 3)
+    _poly(p, [(10.2, 9.3), (10.2, 14.7), (14.6, 12.0)], close=True)
+
+
+def _g_check(p):
+    _poly(p, [(5.5, 12.5), (10, 17), (18.5, 7.5)])
+
+
+def _g_x(p):
+    p.drawLine(QPointF(6.5, 6.5), QPointF(17.5, 17.5))
+    p.drawLine(QPointF(17.5, 6.5), QPointF(6.5, 17.5))
+
+
+def _g_chev_down(p):
+    _poly(p, [(7, 9.5), (12, 14.5), (17, 9.5)])
+
+
+def _g_chev_right(p):
+    _poly(p, [(9.5, 7), (14.5, 12), (9.5, 17)])
+
+
+def _g_chev_left(p):
+    _poly(p, [(14.5, 7), (9.5, 12), (14.5, 17)])
+
+
+def _g_image(p):
+    p.drawRoundedRect(QRectF(3.5, 4.5, 17, 15), 3, 3)
+    p.drawEllipse(QPointF(9, 10), 1.5, 1.5)
+    _poly(p, [(4.5, 17.5), (10, 13), (13, 15.8), (15.5, 13.5), (19.5, 17.5)])
+
+
+def _g_alert(p):
+    _poly(p, [(12, 4.5), (20.5, 19), (3.5, 19)], close=True)
+    p.drawLine(QPointF(12, 10.5), QPointF(12, 14.2))
+    p.drawLine(QPointF(12, 16.7), QPointF(12, 16.8))
+
+
+def _g_phone(p):
+    p.drawRoundedRect(QRectF(7, 3.5, 10, 17), 2.4, 2.4)
+    p.drawLine(QPointF(10.5, 17.6), QPointF(13.5, 17.6))
+
+
+def _g_logo(p):
+    _poly(p, [(7.5, 4.5), (12, 8.5), (16.5, 4.5)])
+    _poly(p, [(7.5, 19.5), (12, 15.5), (16.5, 19.5)])
+    p.drawLine(QPointF(6, 12), QPointF(18, 12))
+
+
+def _g_dash(p):
+    p.drawLine(QPointF(7, 12), QPointF(17, 12))
+
+
+_GLYPHS = {
+    "search": _g_search, "refresh": _g_refresh, "sliders": _g_sliders,
+    "folder": _g_folder, "grid": _g_grid, "film": _g_film, "check": _g_check,
+    "x": _g_x, "chevron-down": _g_chev_down, "chevron-right": _g_chev_right,
+    "chevron-left": _g_chev_left, "image": _g_image, "alert": _g_alert,
+    "phone": _g_phone, "logo": _g_logo, "dash": _g_dash,
+}
+
+
+def draw_glyph(p: QPainter, name: str, rect: QRectF, color, stroke: float = 1.8) -> None:
+    fn = _GLYPHS.get(name)
+    if fn is None:
+        return
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.translate(rect.x(), rect.y())
+    s = rect.width() / 24.0
+    p.scale(s, s)
+    p.setPen(QPen(QColor(color), stroke, Qt.PenStyle.SolidLine,
+                  Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    fn(p)
+    p.restore()
+
+
+def _dpr() -> float:
+    scr = QGuiApplication.primaryScreen()
+    return max(2.0, math.ceil(scr.devicePixelRatio())) if scr else 2.0
+
+
+_ICONS: dict = {}
+
+
+def icon(name: str, color: str = C.MUTED, size: int = 18) -> QIcon:
+    key = (name, color, size)
+    ic = _ICONS.get(key)
+    if ic is not None:
+        return ic
+    scale = _dpr()
+    ic = QIcon()
+    for mode, col in ((QIcon.Mode.Normal, color), (QIcon.Mode.Disabled, C.DIM)):
+        pm = QPixmap(int(size * scale), int(size * scale))
+        pm.fill(Qt.GlobalColor.transparent)
+        pm.setDevicePixelRatio(scale)
+        p = QPainter(pm)
+        draw_glyph(p, name, QRectF(0, 0, size, size), QColor(col))
+        p.end()
+        ic.addPixmap(pm, mode)
+    _ICONS[key] = ic
+    return ic
+
+
+def blank_icon(size: int = 16) -> QIcon:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    return QIcon(pm)
+
+
+# ======================================================================
+# small helpers
+# ======================================================================
+
+def mix(a: QColor, b: QColor, t: float) -> QColor:
+    return QColor(int(a.red() + (b.red() - a.red()) * t),
+                  int(a.green() + (b.green() - a.green()) * t),
+                  int(a.blue() + (b.blue() - a.blue()) * t))
+
+
+def repolish(w: QWidget) -> None:
+    w.style().unpolish(w)
+    w.style().polish(w)
+    w.update()
+
+
+def make_button(text="", variant="", glyph=None, glyph_color=None) -> QPushButton:
+    b = QPushButton(text)
+    b.setProperty("variant", variant)
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    b.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+    if glyph:
+        col = glyph_color or (C.ON_ACCENT if variant == "primary"
+                              else C.ERR if variant == "danger" else C.MUTED)
+        b.setIcon(icon(glyph, col, 16))
+        b.setIconSize(QSize(16, 16))
+    return b
+
+
+def make_scroll(content: QWidget) -> QScrollArea:
+    sa = QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setFrameShape(QFrame.Shape.NoFrame)
+    sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    sa.setWidget(content)
+    content.setAutoFillBackground(False)
+    sa.viewport().setAutoFillBackground(False)
+    return sa
+
+
+def cover_src(pw: int, ph: int, target: QRectF) -> QRectF:
+    """Source rect that center-crops a pw×ph pixmap to fill `target`."""
+    tr = target.width() / max(1.0, target.height())
+    if pw / max(1, ph) > tr:
+        w = ph * tr
+        return QRectF((pw - w) / 2, 0, w, ph)
+    h = pw / tr
+    return QRectF(0, (ph - h) / 2, pw, h)
+
+
+def rounded_path(rect, r) -> QPainterPath:
     path = QPainterPath()
     path.addRoundedRect(QRectF(rect), r, r)
     return path
 
 
-def _draw_refresh_glyph(p: QPainter, center, r: int, color: QColor):
-    """Circular-arrow glyph (no font dependency)."""
-    p.save()
-    pen = QPen(color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-    p.setPen(pen)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    rect = QRect(center.x() - r, center.y() - r, r * 2, r * 2)
-    p.drawArc(rect, 40 * 16, 290 * 16)
-    import math
-    ang = math.radians(40)
-    tip = QPointF(center.x() + r * math.cos(ang), center.y() - r * math.sin(ang))
-    d = r * 0.45
-    a1 = ang + math.radians(35) + math.pi
-    a2 = ang - math.radians(35) + math.pi
-    p.drawLine(tip, tip + QPointF(d * math.cos(a1), -d * math.sin(a1)))
-    p.drawLine(tip, tip + QPointF(d * math.cos(a2), -d * math.sin(a2)))
-    p.restore()
-
-
-def _draw_folder_glyph(p: QPainter, rect: QRect):
-    p.save()
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QBrush(QColor("#33333c")))
-    body = QRect(rect.x(), rect.y() + 8, rect.width(), rect.height() - 8)
-    path = QPainterPath()
-    path.addRoundedRect(QRectF(body), 6, 6)
-    p.drawPath(path)
-    tab = QRect(rect.x(), rect.y(), rect.width() // 2, 14)
-    tpath = QPainterPath()
-    tpath.addRoundedRect(QRectF(tab), 5, 5)
-    p.drawPath(tpath)
-    p.setBrush(QBrush(QColor("#4ade80")))
-    dot = QRect(rect.x() + rect.width() - 16, rect.y() + rect.height() - 16, 8, 8)
-    p.setClipPath(path)
-    p.drawEllipse(dot)
-    p.restore()
-
-
-# ---------- delegates ----------
-
-class FolderDelegate(QStyledItemDelegate):
-    folderOpened = pyqtSignal(object)
-
-    def __init__(self, cache: ThumbCache, parent=None):
-        super().__init__(parent)
-        self.cache = cache
-
-    def sizeHint(self, option, index):
-        return QSize(TILE_W, 196)
-
-    def paint(self, painter, option, index):
-        f: adb.Folder | None = index.data(ROLE_ITEM)
-        if f is None:
-            return
-        p = painter
-        p.save()
-        p.setRenderHints(QPainter.RenderHint.Antialiasing |
-                         QPainter.RenderHint.SmoothPixmapTransform)
-        card = option.rect.adjusted(6, 6, -6, -6)
-        hover = bool(option.state & QStyle.StateFlag.State_MouseOver)
-        p.setPen(QPen(QColor("#3a3a45" if hover else "#2a2a31"), 1))
-        p.setBrush(QBrush(QColor("#202027" if hover else "#1a1a1f")))
-        p.drawRoundedRect(card, RADIUS, RADIUS)
-
-        cover = QRect(card.x() + 10, card.y() + 10, card.width() - 20, THUMB_H)
-        pm = None
-        for v in f.videos:
-            if self.cache.has(v.thumb_key):
-                pm = self.cache.get(v.thumb_key)
-                if pm is not None and not pm.isNull():
-                    break
+def cached_pixmap(cache: ThumbCache, v):
+    if cache.has(v.thumb_key):
+        pm = cache.get(v.thumb_key)
         if pm is not None and not pm.isNull():
-            crop = cover_pixmap(pm, cover.width(), cover.height())
-            p.save()
-            p.setClipPath(_rounded_clip(p, cover, 8))
-            p.drawPixmap(cover, crop)
-            p.restore()
-        else:
-            p.save()
-            p.setClipPath(_rounded_clip(p, cover, 8))
-            p.fillRect(cover, QColor("#232329"))
-            iw = 44
-            _draw_folder_glyph(p, QRect(cover.center().x() - iw // 2,
-                                        cover.center().y() - 20, iw, 36))
-            p.restore()
-        p.setPen(QPen(QColor("#3a3a42"), 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(cover, 8, 8)
-
-        fm = QFontMetrics(p.font())
-        name = fm.elidedText(f.name, Qt.TextElideMode.ElideRight, card.width() - 24)
-        p.setPen(QPen(QColor("#ffffff")))
-        font = QFont(p.font())
-        font.setBold(True)
-        p.setFont(font)
-        p.drawText(QRect(card.x() + 12, cover.bottom() + 6, card.width() - 24, 20),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
-        font.setBold(False)
-        p.setFont(font)
-        p.setPen(QPen(QColor("#8e8e96")))
-        sub = f"{f.count} video{'s' if f.count != 1 else ''} · {fmt_size(f.total_bytes)}"
-        p.drawText(QRect(card.x() + 12, cover.bottom() + 26, card.width() - 24, 18),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, sub)
-        p.restore()
-
-    def editorEvent(self, event, model, option, index):
-        if event.type() == QEvent.Type.MouseButtonRelease:
-            f = index.data(ROLE_ITEM)
-            if f is not None:
-                self.folderOpened.emit(f)
-                return True
-        return False
+            return pm
+    return None
 
 
-class VideoDelegate(QStyledItemDelegate):
-    loadRequested = pyqtSignal(object)
+def rounded_thumb(cache: ThumbCache, v, w: int, h: int, r: int) -> QPixmap:
+    dpr = _dpr()
+    out = QPixmap(int(w * dpr), int(h * dpr))
+    out.fill(Qt.GlobalColor.transparent)
+    out.setDevicePixelRatio(dpr)
+    p = QPainter(out)
+    p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+    p.setClipPath(rounded_path(QRectF(0, 0, w, h), r))
+    pm = cached_pixmap(cache, v)
+    target = QRectF(0, 0, w, h)
+    if pm is not None:
+        p.drawPixmap(target, pm, cover_src(pm.width(), pm.height(), target))
+    else:
+        p.fillRect(target, QColor(C.RAISED))
+        draw_glyph(p, "film", QRectF(w / 2 - 11, h / 2 - 11, 22, 22), QColor(C.DIM))
+    p.end()
+    return out
 
-    def __init__(self, cache: ThumbCache, states: dict, parent=None):
+
+def draw_text(p: QPainter, rect, text: str, color, font: QFont,
+              align=Qt.AlignmentFlag.AlignLeft) -> None:
+    p.setFont(font)
+    p.setPen(QColor(color))
+    text = QFontMetrics(font).elidedText(text, Qt.TextElideMode.ElideRight, int(rect.width()))
+    p.drawText(QRectF(rect), align | Qt.AlignmentFlag.AlignVCenter, text)
+
+
+def draw_spinner(p: QPainter, center: QPointF, r: float, angle: float, color=C.ACCENT, w=2.2):
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    rect = QRectF(center.x() - r, center.y() - r, 2 * r, 2 * r)
+    p.setPen(QPen(QColor(C.BORDER_HI), w))
+    p.drawEllipse(rect)
+    p.setPen(QPen(QColor(color), w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawArc(rect, int((90 - angle) * 16), -100 * 16)
+    p.restore()
+
+
+# ======================================================================
+# reusable widgets
+# ======================================================================
+
+class ElideLabel(QLabel):
+    """Single-line label that elides to the width the layout gives it."""
+
+    def __init__(self, text="", parent=None, mode=Qt.TextElideMode.ElideRight):
         super().__init__(parent)
-        self.cache = cache
-        self.states = states  # thumb_key -> 'loading' | 'failed'
-        self.frame = 0
+        self._full = text or ""
+        self._mode = mode
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        self._apply()
 
-    def sizeHint(self, option, index):
-        return QSize(TILE_W, TILE_H)
+    def setText(self, text):  # noqa: N802
+        self._full = text or ""
+        self._apply()
 
-    # geometry shared by paint + hit test
-    def _geom(self, rect: QRect):
-        card = rect.adjusted(6, 6, -6, -6)
-        thumb = QRect(card.x() + 10, card.y() + 10, card.width() - 20, THUMB_H)
-        load_btn = QRect(thumb.right() - 34, thumb.top() + 6, 28, 28)
-        return card, thumb, load_btn
+    def fullText(self):  # noqa: N802
+        return self._full
 
-    def paint(self, painter, option, index):
-        v: adb.Video | None = index.data(ROLE_ITEM)
+    def resizeEvent(self, e):  # noqa: N802
+        super().resizeEvent(e)
+        self._apply()
+
+    def _apply(self):
+        w = self.width()
+        shown = self.fontMetrics().elidedText(self._full, self._mode, w) if w > 8 else self._full
+        if shown != self.text():
+            super().setText(shown)
+
+
+class LogoMark(QWidget):
+    def __init__(self, size=30, parent=None):
+        super().__init__(parent)
+        self._s = size
+        self.setFixedSize(size, size)
+
+    def paintEvent(self, _e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(C.ACCENT))
+        p.drawRoundedRect(QRectF(self.rect()), self._s * 0.28, self._s * 0.28)
+        m = self._s * 0.16
+        draw_glyph(p, "logo", QRectF(m, m, self._s - 2 * m, self._s - 2 * m),
+                   QColor(C.ON_ACCENT), stroke=2.3)
+
+
+class StateIcon(QWidget):
+    """Tiny status glyph: waiting / active(spinner) / done / failed / skipped / online / offline."""
+
+    def __init__(self, size=20, parent=None):
+        super().__init__(parent)
+        self._s = size
+        self._state = "waiting"
+        self._angle = 0.0
+        self.setFixedSize(size, size)
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(360.0)
+        self._anim.setDuration(900)
+        self._anim.setLoopCount(-1)
+        self._anim.valueChanged.connect(self._tick)
+
+    def set_state(self, state: str):
+        self._state = state
+        if state == "active" and self.isVisible():
+            self._anim.start()
+        else:
+            self._anim.stop()
+        self.update()
+
+    def _tick(self, v):
+        self._angle = float(v)
+        self.update()
+
+    def showEvent(self, e):  # noqa: N802
+        if self._state == "active":
+            self._anim.start()
+        super().showEvent(e)
+
+    def hideEvent(self, e):  # noqa: N802
+        self._anim.stop()
+        super().hideEvent(e)
+
+    def paintEvent(self, _e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s, st = self._s, self._state
+        r = QRectF(1.5, 1.5, s - 3, s - 3)
+        inner = QRectF(s * 0.24, s * 0.24, s * 0.52, s * 0.52)
+        if st == "waiting":
+            p.setPen(QPen(QColor(C.BORDER_HI), 1.6))
+            p.drawEllipse(r)
+        elif st == "active":
+            draw_spinner(p, QPointF(s / 2, s / 2), s / 2 - 2, self._angle)
+        elif st in ("done", "failed"):
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(C.OK if st == "done" else C.ERR))
+            p.drawEllipse(r)
+            draw_glyph(p, "check" if st == "done" else "x", inner, QColor(C.ON_ACCENT), 2.6)
+        elif st == "skipped":
+            p.setPen(QPen(QColor(C.DIM), 1.6))
+            p.drawEllipse(r)
+            draw_glyph(p, "dash", inner, QColor(C.DIM), 2.4)
+        elif st in ("online", "offline"):
+            draw_glyph(p, "phone", QRectF(0, 0, s, s),
+                       QColor(C.OK if st == "online" else C.ERR), 1.8)
+
+
+class Badge(QWidget):
+    """Large round icon used in empty states (glyph or spinner)."""
+
+    def __init__(self, size=76, parent=None):
+        super().__init__(parent)
+        self._s = size
+        self._glyph = "film"
+        self._color = C.MUTED
+        self._busy = False
+        self._angle = 0.0
+        self.setFixedSize(size, size)
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(360.0)
+        self._anim.setDuration(900)
+        self._anim.setLoopCount(-1)
+        self._anim.valueChanged.connect(self._tick)
+
+    def set_content(self, glyph: str, color=C.MUTED, busy=False):
+        self._glyph, self._color, self._busy = glyph, color, busy
+        if busy and self.isVisible():
+            self._anim.start()
+        else:
+            self._anim.stop()
+        self.update()
+
+    def _tick(self, v):
+        self._angle = float(v)
+        self.update()
+
+    def showEvent(self, e):  # noqa: N802
+        if self._busy:
+            self._anim.start()
+        super().showEvent(e)
+
+    def hideEvent(self, e):  # noqa: N802
+        self._anim.stop()
+        super().hideEvent(e)
+
+    def paintEvent(self, _e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s = self._s
+        p.setPen(QPen(QColor(C.BORDER), 1))
+        p.setBrush(QColor(C.SURFACE))
+        p.drawEllipse(QRectF(0.5, 0.5, s - 1, s - 1))
+        if self._busy:
+            draw_spinner(p, QPointF(s / 2, s / 2), s * 0.22, self._angle, C.ACCENT, 3)
+        else:
+            g = s * 0.42
+            draw_glyph(p, self._glyph, QRectF((s - g) / 2, (s - g) / 2, g, g),
+                       QColor(self._color), 1.7)
+
+
+class SlimProgress(QWidget):
+    def __init__(self, height=4, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(height)
+        self._v = 0.0
+        self._mode = "idle"
+        self._color = C.ACCENT
+        self._t = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(1300)
+        self._anim.setLoopCount(-1)
+        self._anim.valueChanged.connect(self._tick)
+
+    def _tick(self, v):
+        self._t = float(v)
+        self.update()
+
+    def set_color(self, color: str):
+        self._color = color
+        self.update()
+
+    def set_idle(self):
+        self._mode, self._v = "idle", 0.0
+        self._anim.stop()
+        self.update()
+
+    def set_value(self, pct: float):
+        self._mode = "value"
+        self._v = max(0.0, min(100.0, float(pct)))
+        self._anim.stop()
+        self.update()
+
+    def set_busy(self):
+        self._mode = "busy"
+        self._anim.start()
+        self.update()
+
+    def paintEvent(self, _e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect())
+        rad = r.height() / 2
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(C.BORDER))
+        p.drawRoundedRect(r, rad, rad)
+        p.setBrush(QColor(self._color))
+        if self._mode == "value" and self._v > 0:
+            p.drawRoundedRect(QRectF(0, 0, max(r.height(), r.width() * self._v / 100.0), r.height()),
+                              rad, rad)
+        elif self._mode == "busy":
+            p.setClipPath(rounded_path(r, rad))
+            seg = r.width() * 0.3
+            x = -seg + (r.width() + seg) * self._t
+            p.drawRoundedRect(QRectF(x, 0, seg, r.height()), rad, rad)
+
+
+class Switch(QAbstractButton):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setFixedSize(40, 24)
+        self._t = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(140)
+        self._anim.valueChanged.connect(self._tick)
+        self.toggled.connect(self._animate)
+
+    def _tick(self, v):
+        self._t = float(v)
+        self.update()
+
+    def _animate(self, on):
+        self._anim.stop()
+        self._anim.setStartValue(self._t)
+        self._anim.setEndValue(1.0 if on else 0.0)
+        self._anim.start()
+
+    def paintEvent(self, _e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        track = mix(QColor(C.BORDER_HI), QColor(C.ACCENT), self._t)
+        if not self.isEnabled():
+            track.setAlpha(110)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+        d = r.height() - 6
+        x = r.x() + 3 + self._t * (r.width() - d - 6)
+        p.setBrush(QColor("#FFFFFF" if self.isEnabled() else C.MUTED))
+        p.drawEllipse(QRectF(x, r.y() + 3, d, d))
+        if self.hasFocus():
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(C.ACCENT_HI), 1.5))
+            p.drawRoundedRect(r.adjusted(-1, -1, 1, 1), 13, 13)
+
+
+class Segmented(QFrame):
+    changed = pyqtSignal(int)
+
+    def __init__(self, labels, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Segmented")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(2)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        for i, text in enumerate(labels):
+            b = QPushButton(text)
+            b.setProperty("seg", True)
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+            self._group.addButton(b, i)
+            lay.addWidget(b, 1)
+        self._group.button(0).setChecked(True)
+        self._group.idClicked.connect(self.changed.emit)
+
+    def index(self) -> int:
+        return max(0, self._group.checkedId())
+
+    def set_index(self, i: int):
+        b = self._group.button(i)
+        if b:
+            b.setChecked(True)
+
+
+class RadioMark(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._on = False
+        self.setFixedSize(18, 18)
+
+    def set_active(self, on: bool):
+        self._on = on
+        self.update()
+
+    def paintEvent(self, _e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(1.5, 1.5, 15, 15)
+        p.setPen(QPen(QColor(C.ACCENT if self._on else C.BORDER_HI), 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(r)
+        if self._on:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(C.ACCENT))
+            p.drawEllipse(QRectF(5.5, 5.5, 7, 7))
+
+
+class EmptyState(QWidget):
+    actionClicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(40, 40, 40, 80)
+        outer.addStretch(1)
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.badge = Badge(76)
+        self.title = QLabel(objectName="H2")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.text = QLabel(objectName="Muted")
+        self.text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.text.setWordWrap(True)
+        self.text.setMaximumWidth(400)
+        self.button = make_button("", "")
+        self.button.clicked.connect(self.actionClicked)
+        col.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignHCenter)
+        col.addSpacing(18)
+        col.addWidget(self.title)
+        col.addSpacing(6)
+        col.addWidget(self.text, 0, Qt.AlignmentFlag.AlignHCenter)
+        col.addSpacing(18)
+        col.addWidget(self.button, 0, Qt.AlignmentFlag.AlignHCenter)
+        outer.addLayout(col)
+        outer.addStretch(2)
+
+    def show_state(self, glyph, title, text, action=None, busy=False, color=C.MUTED):
+        self.badge.set_content(glyph, color, busy)
+        self.title.setText(title)
+        self.text.setText(text)
+        self.text.setVisible(bool(text))
+        self.button.setVisible(bool(action))
+        if action:
+            self.button.setText(action)
+
+
+class Banner(QFrame):
+    actionClicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Banner")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 10, 10, 10)
+        lay.setSpacing(10)
+        ic = QLabel()
+        ic.setPixmap(icon("alert", C.WARN, 18).pixmap(QSize(18, 18)))
+        self.label = QLabel(objectName="BannerText")
+        self.label.setWordWrap(True)
+        self.button = make_button("Check again", "ghost")
+        self.button.clicked.connect(self.actionClicked)
+        lay.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(self.label, 1)
+        lay.addWidget(self.button)
+
+    def set_text(self, text: str):
+        self.label.setText(text)
+
+
+# ======================================================================
+# selection + models
+# ======================================================================
+
+class SelectionStore(QObject):
+    """Keeps the user's selection across folders and searches."""
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items: dict[str, adb.Video] = {}
+
+    def __contains__(self, v) -> bool:
+        return v.phone_path in self._items
+
+    def toggle(self, v):
+        if v.phone_path in self._items:
+            del self._items[v.phone_path]
+        else:
+            self._items[v.phone_path] = v
+        self.changed.emit()
+
+    def set_many(self, videos, on: bool):
+        before = len(self._items)
+        for v in videos:
+            if on:
+                self._items[v.phone_path] = v
+            else:
+                self._items.pop(v.phone_path, None)
+        self.changed.emit()
+        return len(self._items) != before
+
+    def remove(self, v):
+        if self._items.pop(v.phone_path, None) is not None:
+            self.changed.emit()
+
+    def clear(self):
+        if self._items:
+            self._items.clear()
+            self.changed.emit()
+
+    def videos(self) -> list:
+        return list(self._items.values())
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def total_bytes(self) -> int:
+        return sum((v.size or 0) for v in self._items.values())
+
+    def reconcile(self, fresh) -> None:
+        """After a reload: keep only still-existing videos, using the new objects."""
+        by_path = {v.phone_path: v for v in fresh}
+        new = {k: by_path[k] for k in self._items if k in by_path}
+        if list(new) != list(self._items):
+            self._items = new
+            self.changed.emit()
+        else:
+            self._items = new
+
+
+class VideoModel(QAbstractListModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.items: list[adb.Video] = []
+
+    def set_items(self, items):
+        self.beginResetModel()
+        self.items = list(items)
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):  # noqa: N802
+        return 0 if parent.isValid() else len(self.items)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or index.row() >= len(self.items):
+            return None
+        v = self.items[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return v.name
+        if role == ROLE_VIDEO:
+            return v
+        if role == Qt.ItemDataRole.ToolTipRole:
+            bits = [fmt_size(v.size)]
+            if v.duration_ms:
+                bits.append(fmt_dur(v.duration_ms))
+            if v.width:
+                bits.append(f"{v.width}×{v.height}")
+            return f"{v.name}\n{v.folder}\n{'  ·  '.join(bits)}\n{long_date(v.modified)}"
+        return None
+
+
+def thumb_state(cache: ThumbCache, states: dict, v) -> str:
+    if cache.has(v.thumb_key):
+        return "ready"
+    return states.get(v.thumb_key, "empty")
+
+
+# ======================================================================
+# library grid
+# ======================================================================
+
+class VideoCardDelegate(QStyledItemDelegate):
+    INSET = 6
+    PAD = 8
+    TEXT_BLOCK = 58
+
+    def __init__(self, store: SelectionStore, cache: ThumbCache, states: dict, parent=None):
+        super().__init__(parent)
+        self.store, self.cache, self.states = store, cache, states
+        self.tile = QSize(232, 210)
+        self.phase = 0
+        self.show_folder = False
+
+    @classmethod
+    def tile_height(cls, w: int) -> int:
+        thumb_h = round((w - 2 * cls.INSET - 2 * cls.PAD) * 9 / 16)
+        return 2 * cls.INSET + cls.PAD + thumb_h + cls.TEXT_BLOCK
+
+    def sizeHint(self, option, index):  # noqa: N802
+        return self.tile
+
+    def geometry(self, rect: QRect):
+        card = rect.adjusted(self.INSET, self.INSET, -self.INSET, -self.INSET)
+        tw = card.width() - 2 * self.PAD
+        thumb = QRect(card.x() + self.PAD, card.y() + self.PAD, tw, round(tw * 9 / 16))
+        check = QRect(thumb.x() + 8, thumb.y() + 8, 22, 22)
+        action = QRect(0, 0, 104, 26)
+        action.moveCenter(QPoint(thumb.center().x(), thumb.center().y() + 20))
+        return card, thumb, check, action
+
+    def hit_preview(self, rect: QRect, pos: QPoint, v) -> bool:
+        if thumb_state(self.cache, self.states, v) not in ("empty", "failed"):
+            return False
+        return self.geometry(rect)[3].contains(pos)
+
+    def paint(self, p, option, index):
+        v = index.data(ROLE_VIDEO)
         if v is None:
             return
-        p = painter
         p.save()
         p.setRenderHints(QPainter.RenderHint.Antialiasing |
-                         QPainter.RenderHint.SmoothPixmapTransform)
-        card, thumb, load_btn = self._geom(option.rect)
-        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+                         QPainter.RenderHint.SmoothPixmapTransform |
+                         QPainter.RenderHint.TextAntialiasing)
+        card, thumb, check, action = self.geometry(option.rect)
+        selected = v in self.store
         hover = bool(option.state & QStyle.StateFlag.State_MouseOver)
-        p.setPen(QPen(QColor("#4ade80" if selected else ("#3a3a45" if hover else "#2a2a31")),
-                      2 if selected else 1))
-        p.setBrush(QBrush(QColor("#222229" if selected else ("#202027" if hover else "#1a1a1f"))))
-        p.drawRoundedRect(card, RADIUS, RADIUS)
 
-        state = "ready" if self.cache.has(v.thumb_key) else self.states.get(v.thumb_key, "empty")
-        pm = self.cache.get(v.thumb_key) if state == "ready" else None
-        p.save()
-        p.setClipPath(_rounded_clip(p, thumb, 8))
-        if pm is not None and not pm.isNull():
-            p.drawPixmap(thumb, cover_pixmap(pm, thumb.width(), thumb.height()))
+        if selected:
+            bg, border = C.ACCENT_BG, C.ACCENT
+        elif hover:
+            bg, border = C.SURFACE_HI, C.BORDER_HI
         else:
-            p.fillRect(thumb, QColor("#232329"))
+            bg, border = C.SURFACE, C.BORDER
+        p.setPen(QPen(QColor(border), 1.4 if selected else 1))
+        p.setBrush(QColor(bg))
+        p.drawRoundedRect(QRectF(card).adjusted(.5, .5, -.5, -.5), 12, 12)
+
+        # ---- thumbnail
+        state = thumb_state(self.cache, self.states, v)
+        p.save()
+        p.setClipPath(rounded_path(thumb, 8))
+        pm = cached_pixmap(self.cache, v) if state == "ready" else None
+        if pm is not None:
+            tgt = QRectF(thumb)
+            p.drawPixmap(tgt, pm, cover_src(pm.width(), pm.height(), tgt))
+        else:
+            p.fillRect(thumb, QColor(C.RAISED))
+            cx, cy = thumb.center().x(), thumb.center().y()
+            small = QFont(option.font)
+            small.setPixelSize(12)
             if state == "loading":
-                import math
-                p.setPen(QPen(QColor("#4ade80"), 3, Qt.PenStyle.SolidLine,
-                             Qt.PenCapStyle.RoundCap))
-                ang = (self.frame * 30) % 360
-                r = 12
-                sq = QRect(thumb.center().x() - r, thumb.center().y() - 14 - r, r * 2, r * 2)
-                p.drawArc(sq, (90 - ang) * 16, 270 * 16)
-                p.setPen(QPen(QColor("#8e8e96")))
-                p.drawText(QRect(thumb.x(), thumb.center().y() + 4, thumb.width(), 18),
-                           Qt.AlignmentFlag.AlignHCenter, "Loading…")
+                draw_spinner(p, QPointF(cx, cy - 6), 10, self.phase * 30)
+                draw_text(p, QRectF(thumb.x(), cy + 10, thumb.width(), 18), "Loading preview",
+                          C.MUTED, small, Qt.AlignmentFlag.AlignHCenter)
             else:
-                iw = 40
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QBrush(QColor("#3a3a45")))
-                tri = QRect(thumb.center().x() - 11, thumb.center().y() - 22, 26, 26)
-                path = QPainterPath()
-                path.moveTo(tri.x() + 6, tri.y())
-                path.lineTo(tri.x() + 6, tri.y() + tri.height())
-                path.lineTo(tri.x() + tri.width(), tri.y() + tri.height() // 2)
-                path.closeSubpath()
-                p.drawPath(path)
-                if state == "failed":
-                    p.setPen(QPen(QColor("#f87171")))
-                    p.drawText(QRect(thumb.x(), thumb.center().y() + 6, thumb.width(), 18),
-                               Qt.AlignmentFlag.AlignHCenter, "Tap ↻ to retry")
-        p.restore()
-        p.setPen(QPen(QColor("#4ade80" if selected else "#3a3a42"), 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(thumb, 8, 8)
-
-        if state in ("empty", "failed"):
-            p.save()
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(0, 0, 0, 150)))
-            p.drawEllipse(load_btn)
-            _draw_refresh_glyph(p, load_btn.center(), 8, QColor("#ffffff"))
-            p.restore()
-
-        if v.duration_ms > 0:
-            txt = fmt_dur(v.duration_ms)
-            fm = QFontMetrics(p.font())
-            tw = fm.horizontalAdvance(txt) + 14
-            badge = QRect(thumb.right() - tw - 6, thumb.bottom() - 22, tw, 17)
-            p.save()
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(0, 0, 0, 170)))
-            bpath = QPainterPath()
-            bpath.addRoundedRect(QRectF(badge), 8, 8)
-            p.drawPath(bpath)
-            p.setPen(QPen(QColor("#ffffff")))
-            small = QFont(p.font())
-            small.setPointSize(max(8, small.pointSize() - 2))
-            p.setFont(small)
-            p.drawText(badge, Qt.AlignmentFlag.AlignCenter, txt)
-            p.restore()
-
-        fm = QFontMetrics(p.font())
-        name = fm.elidedText(v.name, Qt.TextElideMode.ElideRight, card.width() - 24)
-        p.setPen(QPen(QColor("#ffffff")))
-        p.drawText(QRect(card.x() + 12, thumb.bottom() + 6, card.width() - 24, 20),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
-        p.setPen(QPen(QColor("#8e8e96")))
-        sub = f"{fmt_size(v.size)}"
-        if v.width:
-            sub += f" · {v.width}×{v.height}"
-        p.drawText(QRect(card.x() + 12, thumb.bottom() + 26, card.width() - 24, 18),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, sub)
+                draw_glyph(p, "film", QRectF(cx - 12, cy - 34, 24, 24), QColor(C.DIM), 1.6)
+                failed = state == "failed"
+                p.setPen(QPen(QColor("#5A2E33" if failed else C.BORDER_HI), 1))
+                p.setBrush(QColor(C.RAISED_HI))
+                p.drawRoundedRect(QRectF(action), 13, 13)
+                draw_text(p, QRectF(action), "Retry" if failed else "Load preview",
+                          C.ERR if failed else C.MUTED, small, Qt.AlignmentFlag.AlignHCenter)
         p.restore()
 
-    def editorEvent(self, event, model, option, index):
-        if event.type() == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
-            v = index.data(ROLE_ITEM)
-            if v is None:
-                return False
-            _, _, load_btn = self._geom(option.rect)
-            pos = event.position().toPoint()
-            state = "ready" if self.cache.has(v.thumb_key) else self.states.get(v.thumb_key, "empty")
-            if load_btn.contains(pos) and state in ("empty", "failed"):
-                self.loadRequested.emit(v)
-                return True
-        return False
+        # ---- chips
+        chip_font = QFont(option.font)
+        chip_font.setPixelSize(11)
+        chip_font.setWeight(QFont.Weight.DemiBold)
+        fm = QFontMetrics(chip_font)
+
+        def chip(text, right_edge=None, left_edge=None):
+            w = fm.horizontalAdvance(text) + 12
+            x = (right_edge - w) if right_edge is not None else left_edge
+            rect = QRectF(x, thumb.bottom() - 21, w, 17)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(8, 10, 14, 185))
+            p.drawRoundedRect(rect, 5, 5)
+            draw_text(p, rect, text, "#FFFFFF", chip_font, Qt.AlignmentFlag.AlignHCenter)
+            return w
+
+        rx = thumb.right() - 6 + 1
+        if v.duration_ms:
+            w = chip(fmt_dur(v.duration_ms), right_edge=rx)
+            rx -= w + 4
+        rl = res_label(v)
+        if rl:
+            chip(rl, left_edge=thumb.x() + 6)
+
+        # ---- selection checkbox
+        cr = QRectF(check)
+        if selected:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(C.ACCENT))
+            p.drawEllipse(cr)
+            draw_glyph(p, "check", cr.adjusted(4.5, 4.5, -4.5, -4.5), QColor(C.ON_ACCENT), 2.6)
+        else:
+            p.setPen(QPen(QColor(255, 255, 255, 235 if hover else 170), 1.6))
+            p.setBrush(QColor(8, 10, 14, 150 if hover else 110))
+            p.drawEllipse(cr.adjusted(.8, .8, -.8, -.8))
+
+        # ---- text
+        name_f = QFont(option.font)
+        name_f.setPixelSize(13)
+        name_f.setWeight(QFont.Weight.DemiBold)
+        meta_f = QFont(option.font)
+        meta_f.setPixelSize(12)
+        tx, tw = card.x() + self.PAD + 2, card.width() - 2 * self.PAD - 4
+        y = thumb.bottom() + 10
+        draw_text(p, QRectF(tx, y, tw, 18), v.name, C.TEXT, name_f)
+        size_txt = fmt_size(v.size)
+        right_txt = v.folder if self.show_folder else short_date(v.modified)
+        sw = QFontMetrics(meta_f).horizontalAdvance(size_txt) + 10
+        draw_text(p, QRectF(tx, y + 21, sw, 16), size_txt, C.MUTED, meta_f)
+        draw_text(p, QRectF(tx + sw, y + 21, tw - sw, 16), right_txt, C.DIM, meta_f,
+                  Qt.AlignmentFlag.AlignRight)
+        p.restore()
 
 
-# ---------- settings dialog ----------
+class VideoGrid(QListView):
+    previewRequested = pyqtSignal(object)
+    MIN_TILE = 214
+
+    def __init__(self, store: SelectionStore, cache: ThumbCache, states: dict, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.card_delegate = VideoCardDelegate(store, cache, states, self)
+        self.setItemDelegate(self.card_delegate)
+        self.setViewMode(QListView.ViewMode.IconMode)
+        self.setResizeMode(QListView.ResizeMode.Adjust)
+        self.setMovement(QListView.Movement.Static)
+        self.setSpacing(0)
+        self.setUniformItemSizes(True)
+        self.setWrapping(True)
+        self.setSelectionMode(QListView.SelectionMode.NoSelection)
+        self.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
+        self.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._anchor: int | None = None
+        self._tile = QSize(0, 0)
+        self.verticalScrollBar().setSingleStep(40)
+        self._relayout()
+
+    def set_items(self, items):
+        self._anchor = None
+        self.model().set_items(items)
+
+    def _relayout(self):
+        avail = self.width() - 2 * self.frameWidth() - SCROLLBAR_W
+        if avail < 100:
+            return
+        cols = max(1, avail // self.MIN_TILE)
+        w = avail // cols
+        size = QSize(w, VideoCardDelegate.tile_height(w))
+        if size != self._tile:
+            self._tile = size
+            self.card_delegate.tile = size
+            self.setGridSize(size)
+            self.scheduleDelayedItemsLayout()
+
+    def resizeEvent(self, e):  # noqa: N802
+        super().resizeEvent(e)
+        self._relayout()
+
+    def mousePressEvent(self, e):  # noqa: N802
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = e.position().toPoint()
+        idx = self.indexAt(pos)
+        self.setFocus()
+        if not idx.isValid():
+            return
+        v = idx.data(ROLE_VIDEO)
+        if self.card_delegate.hit_preview(self.visualRect(idx), pos, v):
+            self.previewRequested.emit(v)
+            return
+        items = self.model().items
+        if (e.modifiers() & Qt.KeyboardModifier.ShiftModifier) and self._anchor is not None:
+            lo, hi = sorted((self._anchor, idx.row()))
+            self.store.set_many(items[lo:hi + 1], True)
+        else:
+            self.store.toggle(v)
+            self._anchor = idx.row()
+
+    def mouseMoveEvent(self, e):  # noqa: N802
+        pos = e.position().toPoint()
+        over_card = self.indexAt(pos).isValid()
+        self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if over_card
+                                  else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(e)
+
+
+# ======================================================================
+# sidebar
+# ======================================================================
+
+class NavItem(QAbstractButton):
+    def __init__(self, glyph: str, text: str, count: int | None = None, key=None, parent=None):
+        super().__init__(parent)
+        self.glyph, self._label, self._count, self.key = glyph, text, count, key
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setFixedHeight(38)
+        self.setToolTip(text)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def set_count(self, n):
+        self._count = n
+        self.update()
+
+    def sizeHint(self):  # noqa: N802
+        return QSize(200, 38)
+
+    def enterEvent(self, e):  # noqa: N802
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):  # noqa: N802
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(0.45)
+        r = QRectF(self.rect()).adjusted(0, 1, 0, -1)
+        checked, hover = self.isChecked(), self.underMouse()
+        if checked or hover:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(C.RAISED if checked else C.SURFACE))
+            p.drawRoundedRect(r, 9, 9)
+        if checked:
+            p.setBrush(QColor(C.ACCENT))
+            p.drawRoundedRect(QRectF(0, r.center().y() - 8, 3, 16), 1.5, 1.5)
+        col = C.ACCENT if checked else (C.TEXT if hover else C.MUTED)
+        draw_glyph(p, self.glyph, QRectF(14, r.center().y() - 9, 18, 18), QColor(col), 1.7)
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setWeight(QFont.Weight.DemiBold if checked else QFont.Weight.Medium)
+        right = r.right() - 12
+        if self._count is not None:
+            cf = QFont(self.font())
+            cf.setPixelSize(12)
+            txt = str(self._count)
+            cw = QFontMetrics(cf).horizontalAdvance(txt) + 6
+            draw_text(p, QRectF(right - cw, r.y(), cw, r.height()), txt, C.DIM, cf,
+                      Qt.AlignmentFlag.AlignRight)
+            right -= cw + 6
+        draw_text(p, QRectF(42, r.y(), max(0, right - 42), r.height()), self._label,
+                  C.TEXT if (checked or hover) else "#C3C9D4", f)
+
+
+class DeviceCard(QFrame):
+    refreshClicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("DeviceCard")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 10, 8, 10)
+        lay.setSpacing(10)
+        self.state_icon = StateIcon(22)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        self.title = ElideLabel()
+        self.title.setStyleSheet("font-weight:600;")
+        self.sub = ElideLabel()
+        self.sub.setObjectName("Dim")
+        col.addWidget(self.title)
+        col.addWidget(self.sub)
+        self.refresh_btn = make_button("", "ghost", "refresh")
+        self.refresh_btn.setFixedSize(32, 32)
+        self.refresh_btn.setStyleSheet("padding:0; min-height:32px;")
+        self.refresh_btn.setToolTip("Refresh  (F5)")
+        self.refresh_btn.clicked.connect(self.refreshClicked)
+        lay.addWidget(self.state_icon)
+        lay.addLayout(col, 1)
+        lay.addWidget(self.refresh_btn)
+
+    def set_state(self, state: str, title: str, sub: str, tip: str = ""):
+        self.state_icon.set_state(state)
+        self.title.setText(title)
+        self.sub.setText(sub)
+        self.setToolTip(tip or sub)
+
+
+# ======================================================================
+# inspector (right panel): selection tray + presets + custom settings
+# ======================================================================
+
+class TrayDelegate(QStyledItemDelegate):
+    ROW_H = 52
+
+    def __init__(self, cache: ThumbCache, parent=None):
+        super().__init__(parent)
+        self.cache = cache
+
+    def sizeHint(self, option, index):  # noqa: N802
+        return QSize(100, self.ROW_H)
+
+    @staticmethod
+    def remove_rect(rect: QRect) -> QRect:
+        return QRect(rect.right() - 28, rect.center().y() - 11, 22, 22)
+
+    def paint(self, p, option, index):
+        v = index.data(ROLE_VIDEO)
+        if v is None:
+            return
+        p.save()
+        p.setRenderHints(QPainter.RenderHint.Antialiasing |
+                         QPainter.RenderHint.SmoothPixmapTransform |
+                         QPainter.RenderHint.TextAntialiasing)
+        r = option.rect.adjusted(0, 2, 0, -2)
+        hover = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        if hover:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(C.SURFACE_HI))
+            p.drawRoundedRect(QRectF(r), 8, 8)
+        thumb = QRectF(r.x() + 6, r.center().y() - 16, 56, 32)
+        p.drawPixmap(thumb.toRect().topLeft(), rounded_thumb(self.cache, v, 56, 32, 6))
+        nf = QFont(option.font)
+        nf.setPixelSize(13)
+        nf.setWeight(QFont.Weight.Medium)
+        mf = QFont(option.font)
+        mf.setPixelSize(12)
+        x0 = r.x() + 72
+        w = r.right() - 34 - x0
+        draw_text(p, QRectF(x0, r.y() + 6, w, 18), v.name, C.TEXT, nf)
+        meta = fmt_size(v.size) + (f"   {fmt_dur(v.duration_ms)}" if v.duration_ms else "")
+        draw_text(p, QRectF(x0, r.y() + 24, w, 16), meta, C.MUTED, mf)
+        rr = QRectF(self.remove_rect(r))
+        if hover:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(C.RAISED_HI))
+            p.drawEllipse(rr)
+        draw_glyph(p, "x", rr.adjusted(5, 5, -5, -5), QColor(C.TEXT if hover else C.DIM), 2.0)
+        p.restore()
+
+
+class SelectionTray(QListView):
+    removeRequested = pyqtSignal(object)
+
+    def __init__(self, cache: ThumbCache, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Tray")
+        self.setModel(VideoModel(self))
+        self.tray_delegate = TrayDelegate(cache, self)
+        self.setItemDelegate(self.tray_delegate)
+        self.setSelectionMode(QListView.SelectionMode.NoSelection)
+        self.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
+        self.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def mousePressEvent(self, e):  # noqa: N802
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = e.position().toPoint()
+        idx = self.indexAt(pos)
+        if not idx.isValid():
+            return
+        rect = self.visualRect(idx).adjusted(0, 2, 0, -2)
+        if TrayDelegate.remove_rect(rect).adjusted(-8, -8, 8, 8).contains(pos):
+            self.removeRequested.emit(idx.data(ROLE_VIDEO))
+
+    def mouseMoveEvent(self, e):  # noqa: N802
+        pos = e.position().toPoint()
+        idx = self.indexAt(pos)
+        over = False
+        if idx.isValid():
+            rect = self.visualRect(idx).adjusted(0, 2, 0, -2)
+            over = TrayDelegate.remove_rect(rect).adjusted(-8, -8, 8, 8).contains(pos)
+        self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if over
+                                  else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(e)
+
+
+class PresetCard(QFrame):
+    clicked = pyqtSignal(str)
+
+    def __init__(self, pid: str, preset, parent=None):
+        super().__init__(parent)
+        self.pid = pid
+        self.setObjectName("PresetCard")
+        self.setProperty("active", False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(12)
+        self.mark = RadioMark()
+        outer.addWidget(self.mark, 0, Qt.AlignmentFlag.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        name = QLabel(preset.name, objectName="PresetName")
+        tag = QLabel(preset.tagline, objectName="Muted")
+        tag.setWordWrap(True)
+        chips = QHBoxLayout()
+        chips.setSpacing(6)
+        chips.setContentsMargins(0, 4, 0, 0)
+        if getattr(preset, "hint", ""):
+            chips.addWidget(QLabel(preset.hint, objectName="ChipAccent"))
+        chips.addWidget(QLabel(preset.codec_label, objectName="Chip"))
+        chips.addWidget(QLabel(preset.res_label, objectName="Chip"))
+        chips.addStretch(1)
+        col.addWidget(name)
+        col.addWidget(tag)
+        col.addLayout(chips)
+        outer.addLayout(col, 1)
+
+    def set_active(self, on: bool):
+        self.setProperty("active", on)
+        self.mark.set_active(on)
+        repolish(self)
+
+    def mousePressEvent(self, e):  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.pid)
+
+
+RES_LABELS = ["Original", "1440p", "1080p", "720p"]
+RES_VALUES = [0, 1440, 1080, 720]
+AUDIO_LABELS = ["192k", "160k", "128k", "96k"]
+AUDIO_VALUES = [192, 160, 128, 96]
+
+
+class Inspector(QFrame):
+    startRequested = pyqtSignal()
+
+    def __init__(self, store: SelectionStore, cache: ThumbCache, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Inspector")
+        self.setFixedWidth(344)
+        self.store = store
+        self.preset_id = DEFAULT_PRESET_ID
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # header
+        head = QHBoxLayout()
+        head.setContentsMargins(20, 22, 20, 12)
+        head.setSpacing(8)
+        head.addWidget(QLabel("Selected videos", objectName="H2"))
+        self.count = QLabel("0", objectName="Count")
+        head.addWidget(self.count)
+        head.addStretch(1)
+        self.clear_btn = make_button("Clear all", "link")
+        self.clear_btn.clicked.connect(store.clear)
+        head.addWidget(self.clear_btn)
+        root.addLayout(head)
+
+        # scrolling body
+        body = QWidget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(20, 0, 20, 18)
+        bl.setSpacing(10)
+
+        self.hint = QLabel("Click videos to select them. Hold Shift to select a range, "
+                           "or use Select all.", objectName="Hint")
+        self.hint.setWordWrap(True)
+        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(self.hint)
+        self.tray = SelectionTray(cache)
+        self.tray.removeRequested.connect(store.remove)
+        bl.addWidget(self.tray)
+        bl.addSpacing(10)
+
+        bl.addWidget(QLabel("Quality preset", objectName="H2"))
+        self.cards: dict[str, PresetCard] = {}
+        for pid, preset in PRESETS.items():
+            card = PresetCard(pid, preset)
+            card.clicked.connect(self.set_preset)
+            self.cards[pid] = card
+            bl.addWidget(card)
+
+        bl.addSpacing(6)
+        bl.addWidget(self._build_custom())
+        bl.addStretch(1)
+        root.addWidget(make_scroll(body), 1)
+
+        # footer
+        foot = QFrame(objectName="InspectorFooter")
+        fl = QVBoxLayout(foot)
+        fl.setContentsMargins(20, 14, 20, 18)
+        fl.setSpacing(10)
+        row = QHBoxLayout()
+        self.n_lbl = QLabel("No videos selected", objectName="Muted")
+        self.size_lbl = QLabel("", objectName="Muted")
+        row.addWidget(self.n_lbl)
+        row.addStretch(1)
+        row.addWidget(self.size_lbl)
+        fl.addLayout(row)
+        self.go_btn = make_button("Compress", "primary")
+        self.go_btn.setMinimumHeight(42)
+        self.go_btn.clicked.connect(self.startRequested)
+        fl.addWidget(self.go_btn)
+        root.addWidget(foot)
+
+        self.set_preset(self.preset_id)
+        self.refresh()
+
+    # ----- custom settings card
+    def _build_custom(self) -> QFrame:
+        card = QFrame(objectName="CustomCard")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 12, 14, 12)
+        v.setSpacing(0)
+        top = QHBoxLayout()
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        col.addWidget(QLabel("Custom settings", objectName="PresetName"))
+        col.addWidget(QLabel("Override the preset for this run", objectName="Muted"))
+        top.addLayout(col, 1)
+        self.custom_switch = Switch()
+        top.addWidget(self.custom_switch, 0, Qt.AlignmentFlag.AlignVCenter)
+        v.addLayout(top)
+
+        self.custom_body = QWidget()
+        b = QVBoxLayout(self.custom_body)
+        b.setContentsMargins(0, 14, 0, 0)
+        b.setSpacing(6)
+
+        qrow = QHBoxLayout()
+        qrow.addWidget(QLabel("Quality", objectName="Field"))
+        qrow.addStretch(1)
+        self.crf_lbl = QLabel("", objectName="Muted")
+        qrow.addWidget(self.crf_lbl)
+        b.addLayout(qrow)
+        self.crf_slider = QSlider(Qt.Orientation.Horizontal)
+        self.crf_slider.setRange(16, 28)
+        self.crf_slider.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.crf_slider.valueChanged.connect(
+            lambda x: self.crf_lbl.setText(f"CRF {x}"))
+        b.addWidget(self.crf_slider)
+        ends = QHBoxLayout()
+        ends.addWidget(QLabel("Best quality", objectName="Dim"))
+        ends.addStretch(1)
+        ends.addWidget(QLabel("Smallest file", objectName="Dim"))
+        b.addLayout(ends)
+        b.addSpacing(8)
+
+        b.addWidget(QLabel("Resolution", objectName="Field"))
+        self.res_seg = Segmented(RES_LABELS)
+        b.addWidget(self.res_seg)
+        b.addSpacing(8)
+
+        b.addWidget(QLabel("Audio bitrate", objectName="Field"))
+        self.audio_seg = Segmented(AUDIO_LABELS)
+        b.addWidget(self.audio_seg)
+        b.addSpacing(6)
+        mrow = QHBoxLayout()
+        mrow.addWidget(QLabel("Remove audio"))
+        mrow.addStretch(1)
+        self.mute_switch = Switch()
+        mrow.addWidget(self.mute_switch)
+        b.addLayout(mrow)
+        self.mute_switch.toggled.connect(lambda on: self.audio_seg.setEnabled(not on))
+
+        self.custom_body.setVisible(False)
+        self.custom_switch.toggled.connect(self.custom_body.setVisible)
+        v.addWidget(self.custom_body)
+        return card
+
+    # ----- presets
+    def set_preset(self, pid: str):
+        self.preset_id = pid
+        for k, c in self.cards.items():
+            c.set_active(k == pid)
+        p = PRESETS[pid]
+        self.crf_slider.setValue(p.crf)
+        self.crf_lbl.setText(f"CRF {self.crf_slider.value()}")
+        self.res_seg.set_index(RES_VALUES.index(p.max_height) if p.max_height in RES_VALUES else 0)
+        nearest = min(range(len(AUDIO_VALUES)), key=lambda i: abs(AUDIO_VALUES[i] - p.audio_kbps))
+        self.audio_seg.set_index(nearest)
+
+    def adv_values(self):
+        if not self.custom_switch.isChecked():
+            return None, None, None, False
+        return (self.crf_slider.value(), RES_VALUES[self.res_seg.index()],
+                AUDIO_VALUES[self.audio_seg.index()], self.mute_switch.isChecked())
+
+    # ----- selection state
+    def refresh(self):
+        vids = self.store.videos()
+        n = len(vids)
+        self.count.setVisible(n > 0)
+        self.count.setText(str(n))
+        self.clear_btn.setVisible(n > 0)
+        sb = self.tray.verticalScrollBar()
+        pos = sb.value()
+        self.tray.model().set_items(vids)
+        sb.setValue(pos)
+        self.tray.setVisible(n > 0)
+        self.hint.setVisible(n == 0)
+        self.tray.setFixedHeight(min(n, 4) * TrayDelegate.ROW_H + 12)
+        self.n_lbl.setText(f"{plural(n, 'video')} selected" if n else "No videos selected")
+        self.size_lbl.setText(fmt_size(self.store.total_bytes()) if n else "")
+        self.go_btn.setEnabled(n > 0)
+        self.go_btn.setText(f"Compress {plural(n, 'video')}" if n else "Compress")
+
+
+# ======================================================================
+# queue page
+# ======================================================================
+
+class QueueRow(QFrame):
+    def __init__(self, cache: ThumbCache, video, parent=None):
+        super().__init__(parent)
+        self.video = video
+        self.state = "waiting"
+        self.setObjectName("QueueRow")
+        self.setProperty("state", "waiting")
+        self.setFixedHeight(88)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 12, 16, 12)
+        lay.setSpacing(14)
+        thumb = QLabel()
+        thumb.setFixedSize(96, 54)
+        thumb.setPixmap(rounded_thumb(cache, video, 96, 54, 8))
+        lay.addWidget(thumb)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        col.setContentsMargins(0, 0, 0, 0)
+        self.name = ElideLabel(video.name)
+        self.name.setObjectName("RowName")
+        self.detail = ElideLabel()
+        self.detail.setObjectName("RowDetail")
+        self.bar = SlimProgress(4)
+        col.addWidget(self.name)
+        col.addWidget(self.detail)
+        col.addSpacing(4)
+        col.addWidget(self.bar)
+        lay.addLayout(col, 1)
+        self.icon = StateIcon(22)
+        lay.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.set_state("waiting", f"Waiting  ·  {fmt_size(video.size)}")
+
+    def set_state(self, state: str, detail: str = "", tone: str = ""):
+        self.state = state
+        self.setProperty("state", state)
+        repolish(self)
+        self.icon.set_state(state)
+        self.detail.setProperty("tone", tone)
+        repolish(self.detail)
+        self.detail.setText(detail)
+        if state in ("waiting", "skipped", "failed"):
+            self.bar.set_idle()
+            self.bar.set_color(C.ACCENT)
+
+    def set_stage(self, text: str, pct: int | None = None):
+        self.state = "active"
+        self.setProperty("state", "active")
+        repolish(self)
+        self.icon.set_state("active")
+        self.bar.set_color(C.ACCENT)
+        self.detail.setProperty("tone", "accent")
+        repolish(self.detail)
+        self.detail.setText(text if pct is None else f"{text}  {pct}%")
+        self._stage = text
+        if pct is None:
+            self.bar.set_busy()
+        else:
+            self.bar.set_value(pct)
+
+    def set_progress(self, pct: int):
+        self.bar.set_value(pct)
+        self.detail.setText(f"{getattr(self, '_stage', 'Compressing')}  {pct}%")
+
+    def set_done(self, before: int, after: int, dest: str):
+        saved = (1 - after / before) * 100 if before else 0
+        self.set_state("done", f"{fmt_size(before)} → {fmt_size(after)}   {saved:.0f}% smaller", "ok")
+        self.bar.set_color(C.OK)
+        self.bar.set_value(100)
+        if dest:
+            self.setToolTip(f"Saved to phone as {base_name(dest)}\n{dest}")
+
+    def set_failed(self, msg: str):
+        first = (msg or "Failed").strip().splitlines()[0]
+        self.set_state("failed", first, "err")
+        self.setToolTip(msg)
+
+
+class QueuePage(QWidget):
+    cancelRequested = pyqtSignal()
+    backRequested = pyqtSignal()
+
+    def __init__(self, cache: ThumbCache, parent=None):
+        super().__init__(parent)
+        self.cache = cache
+        self.rows: list[QueueRow] = []
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(24, 0, 24, 0)
+        outer.addStretch(1)
+        wrap = QWidget()
+        wrap.setMaximumWidth(920)
+        wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        outer.addWidget(wrap, 100)
+        outer.addStretch(1)
+
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(0, 36, 0, 24)
+        v.setSpacing(0)
+
+        head = QHBoxLayout()
+        head.setSpacing(16)
+        col = QVBoxLayout()
+        col.setSpacing(6)
+        self.title = QLabel("", objectName="H1")
+        self.subtitle = QLabel("", objectName="Muted")
+        self.subtitle.setWordWrap(True)
+        col.addWidget(self.title)
+        col.addWidget(self.subtitle)
+        head.addLayout(col, 1)
+        self.cancel_btn = make_button("Cancel", "danger")
+        self.cancel_btn.clicked.connect(self.cancelRequested)
+        self.back_btn = make_button("Back to library", "primary", "chevron-left")
+        self.back_btn.clicked.connect(self.backRequested)
+        head.addWidget(self.cancel_btn, 0, Qt.AlignmentFlag.AlignTop)
+        head.addWidget(self.back_btn, 0, Qt.AlignmentFlag.AlignTop)
+        v.addLayout(head)
+        v.addSpacing(20)
+        self.overall = SlimProgress(6)
+        v.addWidget(self.overall)
+        v.addSpacing(20)
+
+        host = QWidget()
+        self.list_l = QVBoxLayout(host)
+        self.list_l.setContentsMargins(0, 0, 4, 0)
+        self.list_l.setSpacing(10)
+        self.list_l.addStretch(1)
+        self.scroll = make_scroll(host)
+        v.addWidget(self.scroll, 1)
+        v.addSpacing(12)
+
+        self.details_btn = make_button("Show details", "ghost", "chevron-right")
+        self.details_btn.clicked.connect(self._toggle_log)
+        v.addWidget(self.details_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self.log_view = QPlainTextEdit(objectName="Log")
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(4000)
+        self.log_view.setFixedHeight(170)
+        self.log_view.hide()
+        v.addSpacing(6)
+        v.addWidget(self.log_view)
+
+    def _toggle_log(self):
+        show = not self.log_view.isVisible()
+        self.log_view.setVisible(show)
+        self.details_btn.setText("Hide details" if show else "Show details")
+        self.details_btn.setIcon(icon("chevron-down" if show else "chevron-right", C.MUTED, 16))
+
+    def append_log(self, msg: str):
+        self.log_view.appendPlainText(str(msg))
+
+    def begin(self, videos):
+        for r in self.rows:
+            self.list_l.removeWidget(r)
+            r.deleteLater()
+        self.rows = []
+        for i, v in enumerate(videos):
+            row = QueueRow(self.cache, v)
+            self.list_l.insertWidget(i, row)
+            self.rows.append(row)
+        self.log_view.clear()
+        self.overall.set_color(C.ACCENT)
+        self.overall.set_value(0)
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setText("Cancel")
+        self.cancel_btn.show()
+        self.back_btn.hide()
+        n = len(videos)
+        self.title.setText(f"Compressing {plural(n, 'video')}")
+        self.subtitle.setText("Each video is copied to this PC, compressed, then copied back to your "
+                              "phone. Keep the phone connected.")
+
+    def activate(self, i: int, total: int):
+        self.title.setText("Compressing video" if total == 1 else f"Compressing {i + 1} of {total}")
+        row = self.rows[i]
+        row.set_stage("Starting", None)
+        self.scroll.ensureWidgetVisible(row, 0, 40)
+
+    def set_overall(self, frac: float):
+        self.overall.set_value(frac * 100)
+
+    def finish(self, stats: dict, total: int):
+        ok, fail = stats["ok"], stats["fail"]
+        before, after = stats["before"], stats["after"]
+        self.cancel_btn.hide()
+        self.back_btn.show()
+        if stats["cancelled"]:
+            self.title.setText("Cancelled")
+            msg = (f"{ok} of {total} finished before you cancelled. "
+                   "Temporary files on this PC were removed.")
+            self.overall.set_color(C.WARN)
+        elif fail == 0:
+            self.title.setText(f"{plural(ok, 'video')} compressed")
+            msg = ""
+            self.overall.set_color(C.OK)
+        elif ok == 0:
+            self.title.setText("Compression failed")
+            msg = "None of the videos could be compressed."
+            self.overall.set_color(C.ERR)
+        else:
+            self.title.setText(f"{ok} of {total} videos compressed")
+            msg = ""
+            self.overall.set_color(C.WARN)
+        if ok and not stats["cancelled"]:
+            pct = (1 - after / before) * 100 if before else 0
+            msg = (f"{fmt_size(before)} → {fmt_size(after)}, {pct:.0f}% smaller. "
+                   "Temporary files on this PC were deleted.")
+        if fail and not stats["cancelled"]:
+            msg = (msg + " " if msg else "") + f"{plural(fail, 'video')} failed — see Show details or the log folder."
+        self.subtitle.setText(msg)
+        self.overall.set_value(100)
+        self.scroll.verticalScrollBar().setValue(0)
+
+
+# ======================================================================
+# settings dialog
+# ======================================================================
+
+class SettingRow(QWidget):
+    def __init__(self, title: str, desc: str, control: QWidget, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(18, 14, 16, 14)
+        lay.setSpacing(14)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t = QLabel(title)
+        t.setStyleSheet("font-weight:600;")
+        self.desc = ElideLabel(desc, mode=Qt.TextElideMode.ElideMiddle)
+        self.desc.setObjectName("Dim")
+        self.desc.setToolTip(desc)
+        col.addWidget(t)
+        col.addWidget(self.desc)
+        lay.addLayout(col, 1)
+        lay.addWidget(control, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def set_desc(self, text: str):
+        self.desc.setText(text)
+        self.desc.setToolTip(text)
+
 
 class SettingsDialog(QDialog):
-    def __init__(self, cache: ThumbCache, parent=None):
+    def __init__(self, cache: ThumbCache, tools: dict, parent=None):
         super().__init__(parent)
         self.cache = cache
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(380)
-        l = QVBoxLayout(self)
-        form = QFormLayout()
-        form.addRow("Version:", QLabel(f"Shrinkit {__version__}"))
-        self.cache_lbl = QLabel(fmt_size(cache.disk_usage()))
-        form.addRow("Thumbnail cache:", self.cache_lbl)
-        self.log_lbl = QLabel(LOG_DIR)
-        self.log_lbl.setWordWrap(True)
-        form.addRow("Logs:", self.log_lbl)
-        l.addLayout(form)
-        row = QHBoxLayout()
-        clear_btn = QPushButton("Clear thumbnail cache")
+        self.setModal(True)
+        self.setFixedWidth(500)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(24, 22, 24, 20)
+        v.setSpacing(0)
+
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        head.addWidget(LogoMark(38))
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        col.addWidget(QLabel("Shrinkit", objectName="H2"))
+        col.addWidget(QLabel(f"Version {__version__}", objectName="Muted"))
+        head.addLayout(col)
+        head.addStretch(1)
+        v.addLayout(head)
+        v.addSpacing(18)
+
+        card = QFrame(objectName="SettingsCard")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+
+        clear_btn = make_button("Clear cache")
         clear_btn.clicked.connect(self._clear)
-        logs_btn = QPushButton("Open logs folder")
-        logs_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(LOG_DIR)))
-        row.addWidget(clear_btn)
-        row.addWidget(logs_btn)
-        l.addLayout(row)
-        close_btn = QPushButton("Close")
-        close_btn.setProperty("primary", True)
-        close_btn.clicked.connect(self.accept)
-        l.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        self.cache_row = SettingRow("Preview cache",
+                                    f"{fmt_size(cache.disk_usage())} stored on this PC", clear_btn)
+        open_btn = make_button("Open folder")
+        open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(LOG_DIR)))
+        rows = [self.cache_row, SettingRow("Log files", LOG_DIR, open_btn)]
+        for name in ("ADB", "FFmpeg"):
+            ok, msg = tools.get(name, (False, "Not checked"))
+            ic = StateIcon(22)
+            ic.set_state("done" if ok else "failed")
+            rows.append(SettingRow(name, msg or ("Ready" if ok else "Not found"), ic))
+        for i, r in enumerate(rows):
+            if i:
+                cl.addWidget(QFrame(objectName="Sep"))
+            cl.addWidget(r)
+        v.addWidget(card)
+        v.addSpacing(18)
+
+        close = make_button("Done", "primary")
+        close.setMinimumWidth(96)
+        close.clicked.connect(self.accept)
+        v.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
 
     def _clear(self):
         self.cache.clear()
-        self.cache_lbl.setText(fmt_size(0))
+        self.cache_row.set_desc(f"{fmt_size(0)} stored on this PC")
 
 
-# ---------- main window ----------
+# ======================================================================
+# main window
+# ======================================================================
+
+SORTS = [
+    ("Newest first", lambda v: v.modified or 0, True),
+    ("Oldest first", lambda v: v.modified or 0, False),
+    ("Largest first", lambda v: v.size or 0, True),
+    ("Longest first", lambda v: v.duration_ms or 0, True),
+    ("Name A–Z", lambda v: v.name.lower(), False),
+]
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Shrinkit")
-        self.resize(900, 660)
-        self.setMinimumSize(680, 520)
+        self.resize(1340, 840)
+        self.setMinimumSize(1180, 680)
+
         self.videos: list[adb.Video] = []
         self.folders: list[adb.Folder] = []
-        self.current_folder: adb.Folder | None = None
-        self.selected: adb.Video | None = None
-        self.return_page = P_HOME
-        self.preset_id = DEFAULT_PRESET_ID
+        self._folders_by_name: dict[str, adb.Folder] = {}
+        self.visible: list[adb.Video] = []
+        self.scope: str | None = None
+        self.sort_idx = 0
+        self.lib_state = "loading"          # loading | ready | error | setup
+        self.error_msg = ""
+        self.deps_ok = True
+        self.tools: dict = {}
+        self.folder_items: list[NavItem] = []
+        self._empty_kind = ""
+
+        self.store = SelectionStore(self)
         self.cache = ThumbCache()
         self.thumb_states: dict[str, str] = {}
         self.loader: VideoLoadWorker | None = None
+
+        # queue state
         self.pipe: PipelineWorker | None = None
+        self.qvideos: list[adb.Video] = []
+        self.qi = -1
+        self.stage = ""
+        self.pct = 0
+        self.cancel_requested = False
+        self.run_cfg = None
+        self.qstats: dict = {}
+
         self.thumbs = ThumbnailWorker(self.cache, self)
         self.thumbs.started_job.connect(self._on_thumb_started)
         self.thumbs.ready.connect(self._on_thumb_ready)
         self.thumbs.failed.connect(self._on_thumb_failed)
         self.thumbs.start()
-        self._spin = QTimer(self)
-        self._spin.setInterval(120)
-        self._spin.timeout.connect(self._tick_spin)
+        self.ticker = QTimer(self)
+        self.ticker.setInterval(60)
+        self.ticker.timeout.connect(self._tick)
+
         self._build()
-
-    # ----- layout -----
-    def _build(self):
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        header = QWidget(objectName="Header")
-        hl = QHBoxLayout(header)
-        hl.setContentsMargins(16, 10, 16, 10)
-        hl.setSpacing(8)
-        title = QLabel("Shrinkit", objectName="Title")
-        sub = QLabel("phone → pc → phone", objectName="Subtitle")
-        self.device_lbl = QLabel("Checking device…", objectName="Muted")
-        refresh = QPushButton("Refresh")
-        refresh.setFixedWidth(90)
-        refresh.clicked.connect(self.load_videos)
-        settings_btn = QPushButton("Settings")
-        settings_btn.setFixedWidth(90)
-        settings_btn.clicked.connect(self._open_settings)
-        hl.addWidget(title)
-        hl.addWidget(sub)
-        hl.addStretch(1)
-        hl.addWidget(self.device_lbl)
-        hl.addWidget(refresh)
-        hl.addWidget(settings_btn)
-        layout.addWidget(header)
-
-        self.dep_banner = QLabel()
-        self.dep_banner.setWordWrap(True)
-        self.dep_banner.setStyleSheet("background:#3a2f10;padding:8px 16px;color:#fbbf24")
-        self.dep_banner.hide()
-        layout.addWidget(self.dep_banner)
-
-        self.stack = QStackedWidget()
-        layout.addWidget(self.stack, 1)
-        self.stack.addWidget(self._page_home())
-        self.stack.addWidget(self._page_folder())
-        self.stack.addWidget(self._page_presets())
-        self.stack.addWidget(self._page_progress())
-        self.stack.addWidget(self._page_done())
-
-        footer = QWidget()
-        fl = QHBoxLayout(footer)
-        fl.setContentsMargins(16, 10, 16, 14)
-        self.back_btn = QPushButton("Back")
-        self.back_btn.clicked.connect(self.go_back)
-        self.next_btn = QPushButton("Continue")
-        self.next_btn.setProperty("primary", True)
-        self.next_btn.clicked.connect(self.go_next)
-        fl.addWidget(self.back_btn)
-        fl.addStretch()
-        fl.addWidget(self.next_btn)
-        layout.addWidget(footer)
-
-        self.setCentralWidget(root)
+        self._shortcuts()
+        self.store.changed.connect(self._on_selection_changed)
         self._check_deps()
-        self._update_nav()
         self.load_videos()
 
-    def _grid_view(self, delegate) -> QListView:
-        view = QListView()
-        view.setViewMode(QListView.ViewMode.IconMode)
-        view.setResizeMode(QListView.ResizeMode.Adjust)
-        view.setMovement(QListView.Movement.Static)
-        view.setSpacing(8)
-        view.setGridSize(QSize(TILE_W + 8, TILE_H + 8))
-        view.setUniformItemSizes(True)
-        view.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
-        view.setItemDelegate(delegate)
-        view.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
-        view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        return view
+    # ------------------------------------------------------------ layout
+    def _build(self):
+        root = QWidget()
+        h = QHBoxLayout(root)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        h.addWidget(self._build_sidebar())
 
-    # ----- page: home (folders / global results) -----
-    def _page_home(self):
-        w = QWidget()
-        l = QVBoxLayout(w)
-        l.setContentsMargins(16, 14, 16, 8)
-        l.setSpacing(8)
-        self.home_search = QLineEdit(placeholderText="Search all videos…")
-        self.home_search.textChanged.connect(self._apply_home_filter)
-        l.addWidget(self.home_search)
-        self.home_title = QLabel("Folders", objectName="Crumb")
-        l.addWidget(self.home_title)
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(0)
+        self.banner = Banner()
+        self.banner.actionClicked.connect(self._recheck)
+        self.banner_wrap = QWidget()
+        bw = QVBoxLayout(self.banner_wrap)
+        bw.setContentsMargins(24, 16, 24, 0)
+        bw.addWidget(self.banner)
+        self.banner_wrap.hide()
+        rv.addWidget(self.banner_wrap)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_library())
+        self.queue = QueuePage(self.cache)
+        self.queue.cancelRequested.connect(self._cancel)
+        self.queue.backRequested.connect(self._leave_queue)
+        self.pages.addWidget(self.queue)
+        rv.addWidget(self.pages, 1)
+        h.addWidget(right, 1)
+        self.setCentralWidget(root)
 
-        self.folder_model = FolderListModel(self)
-        self.folder_delegate = FolderDelegate(self.cache, self)
-        self.folder_delegate.folderOpened.connect(self.open_folder)
-        self.folder_view = self._grid_view(self.folder_delegate)
-        self.folder_view.setModel(self.folder_model)
-        self.folder_view.setSelectionMode(QListView.SelectionMode.NoSelection)
-        l.addWidget(self.folder_view, 1)
+    def _build_sidebar(self) -> QFrame:
+        sb = QFrame(objectName="Sidebar")
+        sb.setFixedWidth(248)
+        v = QVBoxLayout(sb)
+        v.setContentsMargins(16, 20, 16, 16)
+        v.setSpacing(0)
 
-        self.video_model_home = VideoListModel(self)
-        self.video_delegate_home = VideoDelegate(self.cache, self.thumb_states, self)
-        self.video_delegate_home.loadRequested.connect(self._request_thumb)
-        self.home_results = self._grid_view(self.video_delegate_home)
-        self.home_results.setModel(self.video_model_home)
-        self.home_results.setSelectionMode(QListView.SelectionMode.SingleSelection)
-        self.home_results.selectionModel().selectionChanged.connect(self._on_home_select)
-        self.home_results.doubleClicked.connect(lambda *_: self.go_next())
-        self.home_results.hide()
-        l.addWidget(self.home_results, 1)
+        brand = QHBoxLayout()
+        brand.setSpacing(10)
+        brand.setContentsMargins(4, 0, 0, 0)
+        brand.addWidget(LogoMark(30))
+        brand.addWidget(QLabel("Shrinkit", objectName="Brand"))
+        brand.addStretch(1)
+        v.addLayout(brand)
+        v.addSpacing(20)
 
-        self.home_status = QLabel(objectName="Muted")
-        l.addWidget(self.home_status)
-        return w
+        self.device_card = DeviceCard()
+        self.device_card.refreshClicked.connect(self.load_videos)
+        v.addWidget(self.device_card)
+        v.addSpacing(22)
 
-    # ----- page: folder videos -----
-    def _page_folder(self):
-        w = QWidget()
-        l = QVBoxLayout(w)
-        l.setContentsMargins(16, 14, 16, 8)
-        l.setSpacing(8)
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        back = QPushButton("‹ Folders")
-        back.setFixedWidth(100)
-        back.clicked.connect(lambda: (self.stack.setCurrentIndex(P_HOME), self._update_nav()))
-        self.folder_title = QLabel("", objectName="Crumb")
-        self.sort_box = QComboBox()
-        self.sort_box.addItems(["Newest", "Largest", "Longest", "Name A–Z"])
-        self.sort_box.setFixedWidth(130)
-        self.sort_box.currentIndexChanged.connect(self._resort_folder)
-        self.load_all_btn = QPushButton("Load previews")
-        self.load_all_btn.setFixedWidth(140)
-        self.load_all_btn.clicked.connect(self._load_all_thumbs)
-        top.addWidget(back)
-        top.addWidget(self.folder_title)
-        top.addStretch(1)
-        top.addWidget(self.sort_box)
-        top.addWidget(self.load_all_btn)
-        l.addLayout(top)
+        v.addWidget(QLabel("Library", objectName="Section"))
+        v.addSpacing(6)
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        self.nav_all = NavItem("grid", "All videos", 0, key=None)
+        self.nav_group.addButton(self.nav_all)
+        self.nav_all.setChecked(True)
+        v.addWidget(self.nav_all)
+        v.addSpacing(16)
+        v.addWidget(QLabel("Folders", objectName="Section"))
+        v.addSpacing(6)
 
-        self.video_model = VideoListModel(self)
-        self.video_delegate = VideoDelegate(self.cache, self.thumb_states, self)
-        self.video_delegate.loadRequested.connect(self._request_thumb)
-        self.folder_grid = self._grid_view(self.video_delegate)
-        self.folder_grid.setModel(self.video_model)
-        self.folder_grid.setSelectionMode(QListView.SelectionMode.SingleSelection)
-        self.folder_grid.selectionModel().selectionChanged.connect(self._on_folder_select)
-        self.folder_grid.doubleClicked.connect(lambda *_: self.go_next())
-        l.addWidget(self.folder_grid, 1)
-        self.folder_status = QLabel(objectName="Muted")
-        l.addWidget(self.folder_status)
-        return w
+        host = QWidget()
+        self.folder_layout = QVBoxLayout(host)
+        self.folder_layout.setContentsMargins(0, 0, 0, 0)
+        self.folder_layout.setSpacing(2)
+        self.folder_layout.addStretch(1)
+        v.addWidget(make_scroll(host), 1)
+        self.nav_group.buttonClicked.connect(self._on_nav)
 
-    # ----- page: presets -----
-    def _page_presets(self):
-        w = QWidget()
-        l = QVBoxLayout(w)
-        l.setContentsMargins(16, 14, 16, 8)
+        v.addSpacing(10)
+        self.settings_btn = make_button("Settings", "ghost", "sliders")
+        self.settings_btn.setObjectName("SettingsBtn")
+        self.settings_btn.clicked.connect(self._open_settings)
+        v.addWidget(self.settings_btn)
+        self.sidebar = sb
+        return sb
+
+    def _build_library(self) -> QWidget:
+        page = QWidget()
+        h = QHBoxLayout(page)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+
+        content = QWidget()
+        cv = QVBoxLayout(content)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
+
         head = QHBoxLayout()
-        head.setSpacing(12)
-        self.preset_thumb = QLabel()
-        self.preset_thumb.setFixedSize(176, 99)
-        self.preset_thumb.setStyleSheet(
-            "background:#232329;border:1px solid #2e2e35;border-radius:8px;")
-        self.preset_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.sel_info = QLabel()
-        self.sel_info.setStyleSheet("color:#a9a9b2")
-        self.sel_info.setWordWrap(True)
-        head.addWidget(self.preset_thumb)
-        head.addWidget(self.sel_info, 1)
-        l.addLayout(head)
-        self.preset_group = QButtonGroup(self)
-        self.preset_radios: dict[str, QRadioButton] = {}
-        for pid, p in PRESETS.items():
-            r = QRadioButton(
-                f"{p.name}   —   {p.tagline}   ({p.hint})   "
-                f"[{p.codec_label} · {p.res_label}]")
-            r.setChecked(pid == self.preset_id)
-            r.toggled.connect(lambda on, _pid=pid: self._set_preset(_pid) if on else None)
-            self.preset_group.addButton(r)
-            self.preset_radios[pid] = r
-            l.addWidget(r)
-        self.adv_toggle = QCheckBox("Advanced overrides")
-        self.adv_box = QWidget()
-        form = QFormLayout(self.adv_box)
-        self.crf_slider = QSlider(Qt.Orientation.Horizontal)
-        self.crf_slider.setRange(16, 28)
-        self.crf_slider.setValue(PRESETS[self.preset_id].crf)
-        self.crf_lbl = QLabel()
-        self.crf_slider.valueChanged.connect(
-            lambda v: self.crf_lbl.setText(f"CRF {v} (lower = better)"))
-        self.crf_lbl.setText(f"CRF {self.crf_slider.value()} (lower = better)")
-        self.maxh_box = QComboBox()
-        self.maxh_box.addItems(["Original", "1440p max", "1080p max", "720p max"])
-        self.audio_box = QComboBox()
-        self.audio_box.addItems(["192k", "160k", "128k", "96k"])
-        self.audio_box.setCurrentText("128k")
-        self.mute_box = QCheckBox("Remove audio")
-        self._sync_adv_boxes(PRESETS[self.preset_id])
-        form.addRow("Quality", self.crf_slider)
-        form.addRow("", self.crf_lbl)
-        form.addRow("Resolution", self.maxh_box)
-        form.addRow("Audio", self.audio_box)
-        form.addRow("", self.mute_box)
-        self.adv_box.hide()
-        self.adv_toggle.toggled.connect(self.adv_box.setVisible)
-        l.addWidget(self.adv_toggle)
-        l.addWidget(self.adv_box)
-        l.addStretch()
-        return w
+        head.setContentsMargins(28, 26, 28, 0)
+        titles = QVBoxLayout()
+        titles.setSpacing(4)
+        self.title = QLabel("All videos", objectName="H1")
+        self.subtitle = QLabel("", objectName="Muted")
+        titles.addWidget(self.title)
+        titles.addWidget(self.subtitle)
+        head.addLayout(titles, 1)
+        self.select_btn = make_button("Select all", "ghost")
+        self.select_btn.clicked.connect(self._toggle_select_all)
+        head.addWidget(self.select_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        cv.addLayout(head)
 
-    # ----- page: progress -----
-    def _page_progress(self):
-        w = QWidget()
-        l = QVBoxLayout(w)
-        l.setContentsMargins(16, 14, 16, 8)
-        self.step_pull = QLabel("○ 1. Copying from phone")
-        self.step_comp = QLabel("○ 2. Compressing")
-        self.step_push = QLabel("○ 3. Copying back to phone")
-        for s in (self.step_pull, self.step_comp, self.step_push):
-            s.setStyleSheet("font-size:14px;color:#e8e8ea")
-            l.addWidget(s)
-        self.bar = QProgressBar()
-        self.bar.setRange(0, 100)
-        l.addWidget(self.bar)
-        self.log_view = QTextEdit(readOnly=True)
-        l.addWidget(self.log_view, 1)
-        row = QHBoxLayout()
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.clicked.connect(self._cancel)
-        row.addStretch()
-        row.addWidget(self.cancel_btn)
-        l.addLayout(row)
-        return w
+        bar = QHBoxLayout()
+        bar.setContentsMargins(28, 18, 28, 14)
+        bar.setSpacing(10)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search by name or folder")
+        self.search.setMinimumWidth(170)
+        self.search.setMaximumWidth(340)
+        self.search.addAction(icon("search", C.DIM, 16), QLineEdit.ActionPosition.LeadingPosition)
+        self._clear_action = self.search.addAction(icon("x", C.MUTED, 16),
+                                                   QLineEdit.ActionPosition.TrailingPosition)
+        self._clear_action.setVisible(False)
+        self._clear_action.triggered.connect(self.search.clear)
+        self.search.textChanged.connect(self._on_search)
+        self.sort_btn = make_button(SORTS[0][0], "", "chevron-down")
+        self.sort_btn.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.sort_btn.clicked.connect(self._open_sort_menu)
+        self.preview_btn = make_button("Load previews", "", "image")
+        self.preview_btn.clicked.connect(self._load_previews)
+        bar.addWidget(self.search, 1)
+        bar.addWidget(self.sort_btn)
+        bar.addWidget(self.preview_btn)
+        bar.addStretch(2)
+        cv.addLayout(bar)
 
-    # ----- page: done -----
-    def _page_done(self):
-        w = QWidget()
-        l = QVBoxLayout(w)
-        l.setContentsMargins(16, 14, 16, 8)
-        self.done_title = QLabel("✓ Done")
-        self.done_title.setStyleSheet("font-size:22px;font-weight:700;color:#4ade80")
-        self.done_detail = QLabel()
-        self.done_detail.setWordWrap(True)
-        l.addWidget(self.done_title)
-        l.addWidget(self.done_detail)
-        l.addStretch()
-        again = QPushButton("Compress another")
-        again.clicked.connect(self._restart)
-        again.setProperty("primary", True)
-        l.addWidget(again, alignment=Qt.AlignmentFlag.AlignLeft)
-        return w
+        self.lib_stack = QStackedWidget()
+        gridwrap = QWidget()
+        gl = QHBoxLayout(gridwrap)
+        gl.setContentsMargins(22, 0, 6, 0)
+        self.model = VideoModel(self)
+        self.grid = VideoGrid(self.store, self.cache, self.thumb_states)
+        self.grid.setModel(self.model)
+        self.grid.previewRequested.connect(self._request_thumb)
+        gl.addWidget(self.grid)
+        self.lib_stack.addWidget(gridwrap)
+        self.empty = EmptyState()
+        self.empty.actionClicked.connect(self._on_empty_action)
+        self.lib_stack.addWidget(self.empty)
+        cv.addWidget(self.lib_stack, 1)
 
-    # ----- deps / loading -----
+        h.addWidget(content, 1)
+        self.inspector = Inspector(self.store, self.cache)
+        self.inspector.startRequested.connect(self._start_queue)
+        h.addWidget(self.inspector)
+        return page
+
+    def _shortcuts(self):
+        def sc(seq, fn, widget=None):
+            s = QShortcut(QKeySequence(seq), widget or self)
+            if widget is not None:
+                s.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            s.activated.connect(fn)
+            return s
+        sc("Ctrl+F", lambda: (self.search.setFocus(), self.search.selectAll()))
+        sc("F5", self.load_videos)
+        sc("Ctrl+A", self._select_all_visible, self.grid)
+        sc("Escape", self.store.clear, self.grid)
+
+    # ------------------------------------------------------------ deps / loading
     def _check_deps(self):
-        msgs = []
         ok_adb, adb_msg = adb.check_adb()
         ok_ff, ff_msg = ffmpeg.check_ffmpeg()
-        if not ok_adb:
-            msgs.append(f"ADB: {adb_msg}")
-        if not ok_ff:
-            msgs.append(f"FFmpeg: {ff_msg}")
-        if msgs:
-            self.dep_banner.setText(" · ".join(msgs) + " — install, add to PATH, restart Shrinkit.")
-            self.dep_banner.show()
+        self.tools = {"ADB": (ok_adb, adb_msg), "FFmpeg": (ok_ff, ff_msg)}
         self.deps_ok = ok_adb and ok_ff
+        problems = [f"{n}: {m}" for n, (ok, m) in self.tools.items() if not ok]
+        if problems:
+            self.banner.set_text(" · ".join(problems) +
+                                 " — install the missing tool and add it to PATH.")
+            self.banner_wrap.show()
+        else:
+            self.banner_wrap.hide()
+
+    def _recheck(self):
+        self._check_deps()
+        if self.deps_ok:
+            self.load_videos()
 
     def load_videos(self):
-        if getattr(self, "deps_ok", True) is False:
+        if self.pipe is not None or (self.loader is not None and self.loader.isRunning()):
+            return
+        if not self.deps_ok:
             self._check_deps()
             if not self.deps_ok:
+                self.lib_state = "setup"
+                self.device_card.set_state("offline", "Setup needed", "ADB or FFmpeg is missing")
+                self._refresh_grid()
                 return
-        self.device_lbl.setText("Looking for device…")
-        self.home_status.setText("Loading…")
+        self.device_card.set_state("active", "Looking for phone", "Checking USB connection")
+        if not self.videos:
+            self.lib_state = "loading"
+            self._refresh_grid()
         self.loader = VideoLoadWorker(self)
         self.loader.loaded.connect(self._on_videos)
         self.loader.failed.connect(self._on_load_fail)
         self.loader.start()
 
     def _on_videos(self, videos):
-        self.videos = videos
-        self.folders = adb.group_by_folder(videos)
-        self.device_lbl.setText("● Device connected")
-        self.device_lbl.setStyleSheet("color:#4ade80; background:transparent")
-        log.info("loaded %d videos in %d folders", len(videos), len(self.folders))
-        self._apply_home_filter()
-        self._update_nav()
+        self.videos = list(videos)
+        self.folders = adb.group_by_folder(self.videos)
+        self._folders_by_name = {f.name: f for f in self.folders}
+        self.store.reconcile(self.videos)
+        self.lib_state = "ready"
+        total = sum((v.size or 0) for v in self.videos)
+        self.device_card.set_state("online", "Phone connected",
+                                   f"{plural(len(self.videos), 'video')}, {fmt_size(total)}")
+        log.info("loaded %d videos in %d folders", len(self.videos), len(self.folders))
+        self._rebuild_nav()
+        self._refresh_grid()
 
     def _on_load_fail(self, msg):
-        self.device_lbl.setText("○ No device")
-        self.device_lbl.setStyleSheet("color:#f87171; background:transparent")
-        self.home_status.setText(msg)
-        self.folder_model.set_folders([])
-        self.video_model_home.set_videos([])
         log.warning("video load failed: %s", msg)
-        self._update_nav()
+        self.lib_state = "error"
+        self.error_msg = str(msg)
+        self.videos, self.folders, self._folders_by_name = [], [], {}
+        self.store.reconcile([])
+        self.device_card.set_state("offline", "No phone found", "Connect it with USB", tip=str(msg))
+        self._rebuild_nav()
+        self._refresh_grid()
 
-    # ----- home filtering -----
-    def _apply_home_filter(self):
-        q = self.home_search.text().strip().lower()
+    # ------------------------------------------------------------ sidebar nav
+    def _rebuild_nav(self):
+        for it in self.folder_items:
+            self.nav_group.removeButton(it)
+            self.folder_layout.removeWidget(it)
+            it.deleteLater()
+        self.folder_items = []
+        for f in self.folders:
+            it = NavItem("folder", f.name, f.count, key=f.name)
+            self.nav_group.addButton(it)
+            self.folder_layout.insertWidget(self.folder_layout.count() - 1, it)
+            self.folder_items.append(it)
+        self.nav_all.set_count(len(self.videos))
+        if self.scope is not None and self.scope not in self._folders_by_name:
+            self.scope = None
+        target = self.nav_all
+        for it in self.folder_items:
+            if it.key == self.scope:
+                target = it
+        target.setChecked(True)
+
+    def _on_nav(self, btn):
+        self.scope = btn.key
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self._clear_action.setVisible(False)
+        self._refresh_grid()
+        self.grid.verticalScrollBar().setValue(0)
+
+    # ------------------------------------------------------------ library view
+    def _query(self) -> str:
+        return self.search.text().strip()
+
+    def _on_search(self, text):
+        self._clear_action.setVisible(bool(text))
+        self._refresh_grid()
+        self.grid.verticalScrollBar().setValue(0)
+
+    def _scope_videos(self) -> list:
+        if self.scope is None:
+            return self.videos
+        f = self._folders_by_name.get(self.scope)
+        return f.videos if f else []
+
+    def _compute_visible(self) -> list:
+        base = self._scope_videos()
+        q = self._query().lower()
         if q:
-            rows = [v for v in self.videos
-                    if q in v.name.lower() or q in v.folder.lower()]
-            self.video_model_home.set_videos(rows)
-            self.folder_view.hide()
-            self.home_results.show()
-            self.home_title.setText(f"Results ({len(rows)})")
-            self.home_status.setText(
-                f"{len(rows)} / {len(self.videos)} shown" if self.videos else "")
+            base = [v for v in base if q in v.name.lower() or q in v.folder.lower()]
+        _label, key, rev = SORTS[self.sort_idx]
+        try:
+            return sorted(base, key=key, reverse=rev)
+        except TypeError:
+            return list(base)
+
+    def _refresh_grid(self):
+        items = self._compute_visible() if self.lib_state == "ready" else []
+        self.visible = items
+        self.grid.card_delegate.show_folder = self.scope is None
+        self.grid.set_items(items)
+
+        q = self._query()
+        scope_total = len(self._scope_videos())
+        if q:
+            self.title.setText("Search results")
+            self.subtitle.setText(f"{len(items)} of {plural(scope_total, 'video')} match “{q}”")
         else:
-            self.home_results.hide()
-            self.folder_view.show()
-            self.home_title.setText("Folders")
-            self.folder_model.set_folders(self.folders)
-            total = len(self.videos)
-            self.home_status.setText(
-                f"{len(self.folders)} folders · {total} videos"
-                if total else ("No videos found on phone." if self.videos is not None else ""))
+            self.title.setText(self.scope or "All videos")
+            size = sum((v.size or 0) for v in items)
+            self.subtitle.setText(f"{plural(len(items), 'video')}, {fmt_size(size)}"
+                                  if self.lib_state == "ready" else "")
 
-    def _on_home_select(self):
-        rows = self.home_results.selectionModel().selectedIndexes()
-        self.selected = self.video_model_home.videos[rows[0].row()] if rows else None
-        if self.selected:
-            self.return_page = P_HOME
-        self._update_nav()
+        st = self.lib_state
+        if st == "loading":
+            self._show_empty("loading", "film", "Looking for your phone",
+                             "Make sure it is unlocked and connected by USB.", None, busy=True)
+        elif st == "setup":
+            self._show_empty("setup", "alert", "Setup needed",
+                             "Shrinkit needs ADB and FFmpeg. Install them, add both to PATH, "
+                             "then check again.", "Check again", color=C.WARN)
+        elif st == "error":
+            self._show_empty("error", "phone", "No phone found",
+                             (self.error_msg or "Connect your phone with USB and allow USB debugging."),
+                             "Try again", color=C.ERR)
+        elif not self.videos:
+            self._show_empty("empty", "film", "No videos on this phone",
+                             "Record or copy a video to your phone, then refresh.", "Refresh")
+        elif not items:
+            if q:
+                self._show_empty("nomatch", "search", "No matches",
+                                 f"Nothing matches “{q}”. Try a different name or folder.",
+                                 "Clear search")
+            else:
+                self._show_empty("nomatch_folder", "folder", "This folder is empty", "", None)
+        else:
+            self.lib_stack.setCurrentIndex(0)
+        self._sync_toolbar()
 
-    # ----- folder page -----
-    def open_folder(self, folder: adb.Folder):
-        self.current_folder = folder
-        self.folder_title.setText(f"{folder.name} ({folder.count})")
-        self.video_model.set_videos(folder.videos)
-        self.folder_status.setText(
-            f"{folder.count} videos · {fmt_size(folder.total_bytes)}")
-        self.folder_grid.selectionModel().clearSelection()
+    def _show_empty(self, kind, glyph, title, text, action, busy=False, color=C.MUTED):
+        self._empty_kind = kind
+        self.empty.show_state(glyph, title, text, action, busy, color)
+        self.lib_stack.setCurrentIndex(1)
+
+    def _on_empty_action(self):
+        k = self._empty_kind
+        if k == "setup":
+            self._recheck()
+        elif k in ("error", "empty"):
+            self.load_videos()
+        elif k == "nomatch":
+            self.search.clear()
+
+    def _sync_toolbar(self):
+        has = bool(self.visible)
+        self.sort_btn.setEnabled(self.lib_state == "ready")
+        self.search.setEnabled(self.lib_state == "ready" or bool(self._query()))
+        self._sync_select_button()
         self._refresh_thumb_button()
-        self.stack.setCurrentIndex(P_FOLDER)
-        self._update_nav()
+        self.sort_btn.setText(SORTS[self.sort_idx][0])
+        self.select_btn.setVisible(has)
+        self.preview_btn.setVisible(has)
 
-    def _resort_folder(self):
-        idx = self.sort_box.currentIndex()
-        self.video_model.sort_key = ["modified", "size", "duration", "name"][idx]
-        self.video_model.reverse = idx != 3
-        self.video_model.set_videos(self.video_model.videos)
+    def _open_sort_menu(self):
+        menu = QMenu(self)
+        menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.NoDropShadowWindowHint)
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        for i, (label, _k, _r) in enumerate(SORTS):
+            act = menu.addAction(icon("check", C.ACCENT, 16) if i == self.sort_idx
+                                 else blank_icon(16), label)
+            act.triggered.connect(lambda _=False, i=i: self._set_sort(i))
+        menu.exec(self.sort_btn.mapToGlobal(QPoint(0, self.sort_btn.height() + 6)))
 
-    def _on_folder_select(self):
-        rows = self.folder_grid.selectionModel().selectedIndexes()
-        self.selected = self.video_model.videos[rows[0].row()] if rows else None
-        if self.selected:
-            self.return_page = P_FOLDER
-        self._update_nav()
+    def _set_sort(self, i: int):
+        self.sort_idx = i
+        self._refresh_grid()
+        self.grid.verticalScrollBar().setValue(0)
 
-    # ----- thumbnails -----
-    def _request_thumb(self, video: adb.Video):
+    # ------------------------------------------------------------ selection
+    def _select_all_visible(self):
+        self.store.set_many(self.visible, True)
+
+    def _toggle_select_all(self):
+        if not self.visible:
+            return
+        all_on = all(v in self.store for v in self.visible)
+        self.store.set_many(self.visible, not all_on)
+
+    def _sync_select_button(self):
+        if not self.visible:
+            return
+        all_on = all(v in self.store for v in self.visible)
+        self.select_btn.setText("Deselect all" if all_on else f"Select all {len(self.visible)}")
+
+    def _on_selection_changed(self):
+        self.grid.viewport().update()
+        self.inspector.refresh()
+        self._sync_select_button()
+
+    # ------------------------------------------------------------ thumbnails
+    def _repaint(self):
+        self.grid.viewport().update()
+        self.inspector.tray.viewport().update()
+
+    def _ensure_ticker(self):
+        if any(s == "loading" for s in self.thumb_states.values()) and not self.ticker.isActive():
+            self.ticker.start()
+
+    def _tick(self):
+        if not any(s == "loading" for s in self.thumb_states.values()):
+            self.ticker.stop()
+            return
+        self.grid.card_delegate.phase += 1
+        self.grid.viewport().update()
+
+    def _request_thumb(self, video):
         if self.cache.has(video.thumb_key):
-            self._repaint_grids()
+            self._repaint()
             return
         self.thumb_states[video.thumb_key] = "loading"
         n = self.thumbs.enqueue([video])
         log.info("thumb requested: %s (queued=%d)", video.name, n)
-        self._repaint_grids()
+        self._ensure_ticker()
+        self._repaint()
         self._refresh_thumb_button()
 
-    def _load_all_thumbs(self):
-        if not self.current_folder:
+    def _load_previews(self):
+        missing = [v for v in self.visible
+                   if not self.cache.has(v.thumb_key)
+                   and self.thumb_states.get(v.thumb_key) != "loading"][:PREVIEW_BATCH]
+        if not missing:
             return
-        missing = [v for v in self.current_folder.videos
-                   if not self.cache.has(v.thumb_key)]
         for v in missing:
             self.thumb_states[v.thumb_key] = "loading"
         n = self.thumbs.enqueue(missing)
-        log.info("load-all thumbs in %s: %d queued", self.current_folder.name, n)
-        self._repaint_grids()
+        log.info("bulk previews: %d queued", n)
+        self._ensure_ticker()
+        self._repaint()
         self._refresh_thumb_button()
 
     def _on_thumb_started(self, key: str):
         self.thumb_states[key] = "loading"
-        self._repaint_grids()
+        self._ensure_ticker()
+        self._repaint()
 
     def _on_thumb_ready(self, key: str):
         self.thumb_states.pop(key, None)
-        self._repaint_grids()
+        self._repaint()
         self._refresh_thumb_button()
-        self._maybe_refresh_preset_thumb(key)
 
     def _on_thumb_failed(self, key: str, msg: str):
         self.thumb_states[key] = "failed"
         log.warning("thumb failed %s: %s", key[:8], msg)
-        self._repaint_grids()
+        self._repaint()
         self._refresh_thumb_button()
 
-    def _repaint_grids(self):
-        for view in (self.folder_view, self.home_results, self.folder_grid):
-            view.viewport().update()
-
-    def _tick_spin(self):
-        active = any(s == "loading" for s in self.thumb_states.values())
-        if not active:
-            self._spin.stop()
-            return
-        for d in (self.video_delegate, self.video_delegate_home):
-            d.frame += 1
-        self.folder_grid.viewport().update()
-        self.home_results.viewport().update()
-
     def _refresh_thumb_button(self):
-        if not self.current_folder or self.stack.currentIndex() != P_FOLDER:
+        b = self.preview_btn
+        if not self.visible:
+            b.setEnabled(False)
             return
         pending = self.thumbs.pending_count()
-        missing = sum(1 for v in self.current_folder.videos
-                      if not self.cache.has(v.thumb_key))
-        if pending or (missing and any(s == "loading" for s in self.thumb_states.values())):
-            if not self._spin.isActive():
-                self._spin.start()
-            self.load_all_btn.setText(f"Loading… ({pending})")
-            self.load_all_btn.setEnabled(False)
+        loading = any(s == "loading" for s in self.thumb_states.values())
+        missing = sum(1 for v in self.visible if not self.cache.has(v.thumb_key))
+        if pending or (missing and loading):
+            b.setText(f"Loading previews ({pending})" if pending else "Loading previews")
+            b.setEnabled(False)
         elif missing:
-            self.load_all_btn.setText(f"Load previews ({missing})")
-            self.load_all_btn.setEnabled(True)
+            b.setText(f"Load previews ({min(missing, PREVIEW_BATCH)})")
+            b.setEnabled(True)
         else:
-            self.load_all_btn.setText("Previews ready ✓")
-            self.load_all_btn.setEnabled(False)
+            b.setText("Previews loaded")
+            b.setEnabled(False)
 
-    def _maybe_refresh_preset_thumb(self, key: str):
-        if self.selected and self.selected.thumb_key == key \
-                and self.stack.currentIndex() == P_PRESET:
-            self._set_preset_thumb()
-
-    def _set_preset_thumb(self):
-        v = self.selected
-        if v is None:
-            self.preset_thumb.setText("—")
-            return
-        pm = self.cache.get(v.thumb_key) if self.cache.has(v.thumb_key) else None
-        if pm is not None and not pm.isNull():
-            self.preset_thumb.setPixmap(cover_pixmap(pm, 176, 99))
-        else:
-            self.preset_thumb.setText("No preview")
-
-    # ----- misc -----
+    # ------------------------------------------------------------ settings
     def _open_settings(self):
-        SettingsDialog(self.cache, self).exec()
+        SettingsDialog(self.cache, self.tools, self).exec()
 
-    def _set_preset(self, pid):
-        self.preset_id = pid
-        p = PRESETS[pid]
-        self.crf_slider.setValue(p.crf)
-        self._sync_adv_boxes(p)
+    # ------------------------------------------------------------ batch queue
+    def _start_queue(self):
+        vids = self.store.videos()
+        if not vids or self.pipe is not None:
+            return
+        preset = PRESETS[self.inspector.preset_id]
+        crf, maxh, ab, mute = self.inspector.adv_values()
+        self.run_cfg = (preset, crf, maxh, ab, mute)
+        self.qvideos = vids
+        self.qi = -1
+        self.cancel_requested = False
+        self.qstats = {"ok": 0, "fail": 0, "before": 0, "after": 0,
+                       "cancelled": False, "done": []}
+        log.info("batch start: %d videos preset=%s", len(vids), self.inspector.preset_id)
+        self.queue.begin(vids)
+        self.sidebar.setEnabled(False)
+        self.pages.setCurrentIndex(PAGE_QUEUE)
+        self._run_next()
 
-    def _sync_adv_boxes(self, p):
-        res_labels = {0: "Original", 1440: "1440p max",
-                      1080: "1080p max", 720: "720p max"}
-        self.maxh_box.setCurrentText(res_labels.get(p.max_height, "Original"))
-        self.audio_box.setCurrentText(f"{p.audio_kbps}k")
+    def _run_next(self):
+        self.qi += 1
+        if self.cancel_requested or self.qi >= len(self.qvideos):
+            self._finish_queue()
+            return
+        v = self.qvideos[self.qi]
+        self.stage, self.pct = "", 0
+        self.queue.activate(self.qi, len(self.qvideos))
+        self._update_overall()
+        preset, crf, maxh, ab, mute = self.run_cfg
+        log.info("compress start: %s", v.phone_path)
+        self.queue.append_log(f"— {v.name}")
+        pipe = PipelineWorker(v, preset, crf, maxh, ab, mute, self)
+        pipe.step.connect(self._on_step)
+        pipe.compress_pct.connect(self._on_pct)
+        pipe.log.connect(self.queue.append_log)
+        pipe.finished.connect(self._on_item_done)
+        pipe.failed.connect(self._on_item_failed)
+        self.pipe = pipe
+        pipe.start()
 
-    def _restart(self):
-        self.selected = None
-        self.current_folder = None
-        self.home_search.clear()
-        self.stack.setCurrentIndex(P_HOME)
-        self._apply_home_filter()
-        self._update_nav()
-
-    # ----- nav -----
-    def _update_nav(self):
-        i = self.stack.currentIndex()
-        self.back_btn.setVisible(i in (P_FOLDER, P_PRESET, P_WORK))
-        self.back_btn.setEnabled(i in (P_FOLDER, P_PRESET))
-        if i in (P_HOME, P_FOLDER):
-            self.next_btn.setText("Continue")
-            self.next_btn.setEnabled(self.selected is not None)
-            self.next_btn.show()
-        elif i == P_PRESET:
-            self.next_btn.setText("Compress")
-            self.next_btn.setEnabled(self.selected is not None)
-            self.next_btn.show()
-        elif i == P_WORK:
-            self.next_btn.setText("Working…")
-            self.next_btn.setEnabled(False)
-            self.next_btn.show()
-        else:
-            self.next_btn.hide()
-        if i == P_FOLDER:
-            self._refresh_thumb_button()
-
-    def go_back(self):
-        i = self.stack.currentIndex()
-        if i == P_FOLDER:
-            self.stack.setCurrentIndex(P_HOME)
-        elif i == P_PRESET:
-            self.stack.setCurrentIndex(self.return_page)
-        self._update_nav()
-
-    def go_next(self):
-        i = self.stack.currentIndex()
-        if i in (P_HOME, P_FOLDER) and self.selected:
-            self.return_page = i
-            p = PRESETS[self.preset_id]
-            self.sel_info.setText(
-                f"<b>{self.selected.name}</b><br>"
-                f"{fmt_size(self.selected.size)} · {fmt_dur(self.selected.duration_ms)}"
-                + (f" · {self.selected.width}×{self.selected.height}"
-                   if self.selected.width else "")
-                + f" · {self.selected.folder}<br>Preset: <b>{p.name}</b> "
-                f"({p.codec_label} CRF {p.crf} · {p.res_label})")
-            self._set_preset_thumb()
-            self.stack.setCurrentIndex(P_PRESET)
-            self._update_nav()
-        elif i == P_PRESET and self.selected:
-            self._start_pipeline()
-
-    # ----- pipeline -----
-    def _adv_values(self):
-        if not self.adv_toggle.isChecked():
-            return None, None, None, False
-        maxh = {"Original": 0, "1440p max": 1440, "1080p max": 1080,
-                "720p max": 720}[self.maxh_box.currentText()]
-        ab = int(self.audio_box.currentText().replace("k", ""))
-        return self.crf_slider.value(), maxh, ab, self.mute_box.isChecked()
-
-    def _start_pipeline(self):
-        crf, maxh, ab, mute = self._adv_values()
-        self.stack.setCurrentIndex(P_WORK)
-        self._update_nav()
-        self.bar.setValue(0)
-        self.log_view.clear()
-        for s in (self.step_pull, self.step_comp, self.step_push):
-            s.setText(s.text().replace("●", "○").replace("✓", "○"))
-        log.info("compress start: %s preset=%s", self.selected.phone_path, self.preset_id)
-        self.pipe = PipelineWorker(self.selected, PRESETS[self.preset_id],
-                                   crf, maxh, ab, mute, self)
-        self.pipe.step.connect(self._on_step)
-        self.pipe.compress_pct.connect(self.bar.setValue)
-        self.pipe.log.connect(lambda m: self.log_view.append(m))
-        self.pipe.finished.connect(self._on_done)
-        self.pipe.failed.connect(self._on_fail)
-        self.pipe.start()
+    def _row(self):
+        return self.queue.rows[self.qi] if 0 <= self.qi < len(self.queue.rows) else None
 
     def _on_step(self, s):
-        mapping = {"pull": self.step_pull, "compress": self.step_comp, "push": self.step_push}
-        if s in mapping:
-            for k, lbl in mapping.items():
-                base = lbl.text().split(". ", 1)[-1].replace("✓ ", "").replace("● ", "")
-                num = {"pull": "1", "compress": "2", "push": "3"}[k]
-                if k == s:
-                    lbl.setText(f"● {num}. {base} — working…")
-                elif list(mapping).index(k) < list(mapping).index(s):
-                    lbl.setText(f"✓ {num}. {base}")
-        if s == "compress":
-            self.step_pull.setText("✓ 1. Copying from phone")
+        row = self._row()
+        if row is None:
+            return
+        if s == "pull":
+            self.stage = "pull"
+            row.set_stage("Copying from your phone")
+        elif s == "compress":
+            self.stage, self.pct = "compress", 0
+            row.set_stage("Compressing", 0)
         elif s == "push":
-            self.step_comp.setText("✓ 2. Compressing")
-            self.bar.setValue(100)
-        elif s == "done":
-            self.step_push.setText("✓ 3. Copying back to phone")
+            self.stage = "push"
+            row.set_stage("Copying back to your phone")
+        self._update_overall()
 
-    def _on_done(self, res):
-        before = res.get("in_bytes", 0)
-        after = res.get("out_bytes", 0)
-        saved = (1 - after / before) * 100 if before else 0
+    def _on_pct(self, pct):
+        row = self._row()
+        if row is None:
+            return
+        self.pct = int(pct)
+        row.set_progress(self.pct)
+        self._update_overall()
+
+    def _update_overall(self):
+        frac = {"pull": 0.03, "compress": 0.08 + 0.84 * self.pct / 100.0,
+                "push": 0.95}.get(self.stage, 0.0)
+        self.queue.set_overall((self.qi + frac) / max(1, len(self.qvideos)))
+
+    def _on_item_done(self, res):
+        row = self._row()
+        before, after = res.get("in_bytes", 0), res.get("out_bytes", 0)
+        if row is not None:
+            row.set_done(before, after, res.get("dest", ""))
+        st = self.qstats
+        st["ok"] += 1
+        st["before"] += before
+        st["after"] += after
+        st["done"].append(self.qvideos[self.qi])
         log.info("compress done: %s %d -> %d", res.get("dest"), before, after)
-        self.done_detail.setText(
-            f"Saved to phone as:\n{res.get('dest', '')}\n\n"
-            f"Before {fmt_size(before)} → After {fmt_size(after)} ({saved:.0f}% smaller).\n"
-            f"Temp files on PC were deleted.")
-        self.stack.setCurrentIndex(P_DONE)
-        self._update_nav()
+        self._advance()
 
-    def _on_fail(self, msg):
+    def _on_item_failed(self, msg):
         log.warning("compress failed: %s", msg)
-        if "Cancelled" in msg:
-            QMessageBox.information(self, "Cancelled", "Cancelled. Temp files cleaned up.")
+        row = self._row()
+        if self.cancel_requested or "Cancelled" in str(msg):
+            self.cancel_requested = True
+            self.qstats["cancelled"] = True
+            if row is not None:
+                row.set_state("skipped", "Cancelled")
         else:
-            QMessageBox.critical(self, "Failed", f"{msg}\n\nSee logs: {LOG_DIR}")
-        self.stack.setCurrentIndex(P_PRESET)
-        self._update_nav()
+            self.qstats["fail"] += 1
+            if row is not None:
+                row.set_failed(str(msg))
+            self.queue.append_log(f"Failed: {msg}")
+        self._advance()
+
+    def _advance(self):
+        QTimer.singleShot(0, self._run_next)
+
+    def _finish_queue(self):
+        self.pipe = None
+        if self.cancel_requested:
+            self.qstats["cancelled"] = True
+            for row in self.queue.rows:
+                if row.state == "waiting":
+                    row.set_state("skipped", "Skipped")
+        self.queue.finish(self.qstats, len(self.qvideos))
 
     def _cancel(self):
-        if self.pipe:
+        self.cancel_requested = True
+        self.queue.cancel_btn.setEnabled(False)
+        self.queue.cancel_btn.setText("Cancelling…")
+        if self.pipe is not None:
             self.pipe.cancel()
 
-    def closeEvent(self, event):
+    def _leave_queue(self):
+        done = self.qstats.get("done", [])
+        self.sidebar.setEnabled(True)
+        self.pages.setCurrentIndex(PAGE_LIBRARY)
+        if done:
+            self.store.set_many(done, False)
+            self.load_videos()
+
+    # ------------------------------------------------------------ shutdown
+    def closeEvent(self, event):  # noqa: N802
         try:
+            self.cancel_requested = True
             if self.pipe:
                 self.pipe.cancel()
                 self.pipe.wait(2000)
@@ -1133,7 +2648,7 @@ class MainWindow(QMainWindow):
                 self.loader.wait(2000)
             self.thumbs.clear_pending()
             self.thumbs.stop()
-            self._spin.stop()
+            self.ticker.stop()
         except Exception:
             pass
         super().closeEvent(event)
@@ -1142,7 +2657,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Shrinkit")
-    app.setStyleSheet(build_stylesheet())
+    apply_theme(app)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
